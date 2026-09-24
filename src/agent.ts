@@ -1,0 +1,480 @@
+import { BackendError, type ActionRequest, type SmsBackend } from './backend.js';
+import type { AgentClaims } from './claims.js';
+import type { Config } from './config.js';
+import {
+  historyForModel,
+  type Conversation,
+  type TranscriptEntry,
+} from './conversations.js';
+import { plainAnswer } from './intent.js';
+import {
+  addUsage,
+  emptyUsage,
+  ModelError,
+  type ChatModel,
+  type Message,
+  type ModelTool,
+  type TokenUsage,
+} from './llm.js';
+import { ToolServerError, type DraftInfo, type ToolSource, type ToolSpec } from './mcp.js';
+import { BASE_PROMPT, contextMessage, type ReplyMode } from './prompt.js';
+
+/** Streamed to the app as server-sent events, in this order. */
+export type AgentEvent =
+  | { type: 'start'; conversationId: string }
+  | { type: 'status'; tool: string; label: string }
+  | { type: 'token'; text: string }
+  | { type: 'draft'; drafts: DraftInfo[] }
+  | { type: 'action'; ok: boolean; text: string; actionIds: string[]; outcome: ActionOutcome }
+  | { type: 'usage'; credits: number; remaining: number; limit: number }
+  | { type: 'done'; text: string }
+  | { type: 'error'; code: ErrorCode; message: string };
+
+export type ErrorCode =
+  | 'SESSION_EXPIRED'
+  | 'CREDITS_EXHAUSTED'
+  | 'FORBIDDEN'
+  | 'MODEL_UNAVAILABLE'
+  | 'TOOLS_UNAVAILABLE'
+  | 'INTERNAL';
+
+export type ActionOutcome = 'done' | 'cancelled' | 'failed' | 'partial';
+
+export interface ActionResult {
+  ok: boolean;
+  outcome: ActionOutcome;
+  text: string;
+  actionIds: string[];
+}
+
+/**
+ * The model never sees confirm_action: approving a change is the user's
+ * act — a Confirm button, or a plain "yes" recognised by intent.ts — and this
+ * service carries it out. A model misled by text inside the data therefore
+ * cannot approve anything.
+ */
+const HOST_ONLY_TOOLS = new Set(['confirm_action']);
+
+export class AgentFailure extends Error {
+  constructor(
+    readonly code: ErrorCode,
+    message: string,
+  ) {
+    super(message);
+  }
+}
+
+export function toFailure(err: unknown): AgentFailure {
+  if (err instanceof AgentFailure) return err;
+  if (err instanceof ToolServerError || err instanceof BackendError) {
+    if (err.status === 401) {
+      return new AgentFailure('SESSION_EXPIRED', 'The assistant session has expired.');
+    }
+    if (err.status === 402) {
+      return new AgentFailure(
+        'CREDITS_EXHAUSTED',
+        err.message ||
+          "This school's AI Assistant credits for the month are used up. An administrator can add more.",
+      );
+    }
+    if (err.status === 403) return new AgentFailure('FORBIDDEN', err.message);
+    return new AgentFailure('TOOLS_UNAVAILABLE', err.message);
+  }
+  if (err instanceof ModelError) {
+    return new AgentFailure('MODEL_UNAVAILABLE', err.message);
+  }
+  console.error('[sms-agent] turn failed', err);
+  return new AgentFailure('INTERNAL', 'Something went wrong. Try again in a moment.');
+}
+
+/** MCP input schema → OpenAI function parameters. */
+export function toModelTools(tools: ToolSpec[]): ModelTool[] {
+  return tools
+    .filter((t) => !HOST_ONLY_TOOLS.has(t.name))
+    .map((t) => {
+      const { $schema: _ignored, ...parameters } = t.inputSchema;
+      return {
+        type: 'function' as const,
+        function: { name: t.name, description: t.description, parameters },
+      };
+    });
+}
+
+function statusLabel(tool: ToolSpec | undefined, name: string): string {
+  const title = tool?.title ?? name.replace(/_/g, ' ');
+  return name.startsWith('draft_') ? `Preparing: ${title}` : `Checking: ${title}`;
+}
+
+function isLive(d: DraftInfo, now = Date.now()) {
+  return !d.expires_at || Date.parse(d.expires_at) > now;
+}
+
+export interface TurnInput {
+  conv: Conversation;
+  claims: AgentClaims;
+  message: string;
+  mode: ReplyMode;
+  tools: ToolSource;
+  backend: SmsBackend;
+  emit: (e: AgentEvent) => void;
+  signal?: AbortSignal;
+}
+
+export class Agent {
+  constructor(
+    private readonly config: Config,
+    private readonly model: ChatModel,
+  ) {}
+
+  /** One user message → streamed reply, tool calls and drafts. */
+  async runTurn(input: TurnInput): Promise<void> {
+    const { conv, message, emit } = input;
+    conv.transcript.push({ role: 'user', text: message, at: new Date().toISOString() });
+
+    if (await this.answerPendingDraft(input)) return;
+
+    let usage = emptyUsage();
+    const entry: TranscriptEntry = { role: 'assistant', text: '', at: '' };
+    try {
+      const quota = await input.backend.quota();
+      if (quota.remaining <= 0) {
+        throw new AgentFailure(
+          'CREDITS_EXHAUSTED',
+          `This school has used all ${quota.limit} AI Assistant credits for ${quota.month}. An administrator can add more.`,
+        );
+      }
+      const { tools, instructions } = await input.tools.catalog();
+      const byName = new Map(tools.map((t) => [t.name, t]));
+      const modelTools = toModelTools(tools);
+      const allowed = new Set(modelTools.map((t) => t.function.name));
+
+      conv.history.push({ role: 'user', content: message });
+      const messages: Message[] = [
+        { role: 'system', content: BASE_PROMPT },
+        {
+          role: 'system',
+          content: contextMessage(input.claims, input.mode, instructions),
+        },
+        ...historyForModel(conv.history, this.config.historyBudgetChars),
+      ];
+
+      const drafts: DraftInfo[] = [];
+      let text = '';
+      let finished = false;
+      for (let round = 0; round < this.config.maxToolRounds; round++) {
+        if (text && !text.endsWith('\n')) {
+          text += '\n\n';
+          emit({ type: 'token', text: '\n\n' });
+        }
+        const reply = await this.model.complete(
+          {
+            messages,
+            tools: modelTools,
+            cacheKey: `sms-agent:${input.claims.schoolId}:${input.claims.role}`,
+            signal: input.signal,
+          },
+          (delta) => {
+            text += delta;
+            emit({ type: 'token', text: delta });
+          },
+        );
+        usage = addUsage(usage, reply.usage);
+
+        const assistant: Message = reply.toolCalls.length
+          ? {
+              role: 'assistant',
+              content: reply.content || null,
+              tool_calls: reply.toolCalls.map((c) => ({
+                id: c.id,
+                type: 'function' as const,
+                function: { name: c.name, arguments: c.arguments },
+              })),
+            }
+          : { role: 'assistant', content: reply.content };
+        messages.push(assistant);
+        conv.history.push(assistant);
+        if (!reply.toolCalls.length) {
+          finished = true;
+          break;
+        }
+
+        for (const call of reply.toolCalls) {
+          emit({ type: 'status', tool: call.name, label: statusLabel(byName.get(call.name), call.name) });
+        }
+        const results = await Promise.all(
+          reply.toolCalls.map(async (call) => {
+            if (!allowed.has(call.name)) {
+              return { text: `Unknown tool ${call.name}.`, isError: true };
+            }
+            let args: Record<string, unknown>;
+            try {
+              args = call.arguments ? JSON.parse(call.arguments) : {};
+            } catch {
+              return { text: 'Invalid tool arguments (not JSON).', isError: true };
+            }
+            return input.tools.call(call.name, args);
+          }),
+        );
+        reply.toolCalls.forEach((call, i) => {
+          const r = results[i]!;
+          if ('draft' in r && r.draft) drafts.push(r.draft);
+          const content = r.text.slice(0, this.config.toolResultMaxChars);
+          const toolMsg: Message = {
+            role: 'tool',
+            tool_call_id: call.id,
+            content: r.isError ? `ERROR: ${content}` : content,
+          };
+          messages.push(toolMsg);
+          conv.history.push(toolMsg);
+        });
+      }
+
+      if (!finished) {
+        const note =
+          "I couldn't finish that in one go. Please try a simpler or more specific request.";
+        text += text ? `\n\n${note}` : note;
+        emit({ type: 'token', text: note });
+        conv.history.push({ role: 'assistant', content: note });
+      }
+
+      if (drafts.length) {
+        await this.replacePending(conv, drafts, input.backend);
+        emit({ type: 'draft', drafts });
+        entry.drafts = drafts.map((d) => ({ ...d, state: 'pending' }));
+      }
+      entry.text = text.trim();
+      emit({ type: 'done', text: entry.text });
+    } catch (err) {
+      if (input.signal?.aborted) {
+        entry.text = '(Stopped.)';
+        return;
+      }
+      const f = toFailure(err);
+      emit({ type: 'error', code: f.code, message: f.message });
+      entry.text = f.message;
+    } finally {
+      entry.at = new Date().toISOString();
+      if (entry.text) conv.transcript.push(entry);
+      await this.reportUsage(input, usage);
+    }
+  }
+
+  /** Charges the school for the model tokens this turn used. */
+  private async reportUsage(input: TurnInput, usage: TokenUsage) {
+    if (!usage.input && !usage.cached && !usage.output) return;
+    try {
+      const r = await input.backend.reportUsage({
+        kind: 'LLM',
+        model: this.model.name,
+        inputTokens: usage.input,
+        cachedInputTokens: usage.cached,
+        outputTokens: usage.output,
+      });
+      input.emit({
+        type: 'usage',
+        credits: r.credits,
+        remaining: r.quota.remaining,
+        limit: r.quota.limit,
+      });
+    } catch (err) {
+      console.error('[sms-agent] usage report failed', (err as Error).message);
+    }
+  }
+
+  /** New drafts replace the previous reply's: the user can't confirm stale ones. */
+  private async replacePending(conv: Conversation, drafts: DraftInfo[], backend: SmsBackend) {
+    const keep = new Set(drafts.flatMap((d) => d.action_ids));
+    const stale = conv.pending.flatMap((d) => d.action_ids).filter((id) => !keep.has(id));
+    await Promise.all(stale.map((id) => backend.cancelAction(id).catch(() => undefined)));
+    this.markDrafts(conv, stale, 'cancelled');
+    conv.pending = drafts;
+  }
+
+  /**
+   * A plain yes/no while drafts are pending is answered here, without the
+   * model. Returns false when the message is anything else.
+   */
+  private async answerPendingDraft(input: TurnInput): Promise<boolean> {
+    const { conv, emit } = input;
+    if (!conv.pending.length) return false;
+    const answer = plainAnswer(input.message);
+    if (!answer) return false;
+
+    const live = conv.pending.filter((d) => isLive(d));
+    const ids = live.flatMap((d) => d.action_ids);
+    let result: ActionResult;
+    if (!ids.length) {
+      this.markDrafts(conv, conv.pending.flatMap((d) => d.action_ids), 'cancelled');
+      conv.pending = [];
+      result = {
+        ok: false,
+        outcome: 'failed',
+        text: 'That draft has expired, so nothing was changed. Ask me again to prepare it afresh.',
+        actionIds: [],
+      };
+    } else if (answer === 'no') {
+      result = await this.cancel(conv, ids, input.backend, false);
+    } else if (this.config.confirmMode === 'user') {
+      result = {
+        ok: false,
+        outcome: 'failed',
+        text: 'Please press Confirm on the draft to approve this change.',
+        actionIds: [],
+      };
+    } else {
+      try {
+        result = await this.confirm(conv, ids, input.backend, false);
+      } catch (err) {
+        const f = toFailure(err);
+        emit({ type: 'error', code: f.code, message: f.message });
+        return true;
+      }
+    }
+    conv.history.push({ role: 'user', content: input.message });
+    conv.history.push({ role: 'assistant', content: result.text });
+    conv.transcript.push({ role: 'assistant', text: result.text, at: new Date().toISOString() });
+    if (result.actionIds.length && result.outcome !== 'failed') {
+      emit({ type: 'action', ...result });
+    }
+    emit({ type: 'token', text: result.text });
+    emit({ type: 'done', text: result.text });
+    return true;
+  }
+
+  private pendingIds(conv: Conversation, ids: string[]): string[] {
+    const pending = new Set(conv.pending.flatMap((d) => d.action_ids));
+    const unknown = ids.filter((id) => !pending.has(id));
+    if (unknown.length) {
+      throw new AgentFailure(
+        'FORBIDDEN',
+        'That draft is no longer waiting for confirmation in this conversation.',
+      );
+    }
+    return ids;
+  }
+
+  /** Confirm button (agent mode) or a plain yes: confirm, then run. */
+  async confirm(
+    conv: Conversation,
+    ids: string[],
+    backend: SmsBackend,
+    fromButton = true,
+  ): Promise<ActionResult> {
+    this.pendingIds(conv, ids);
+    return this.run(conv, ids, backend, (id) => backend.confirmAction(id), fromButton, 'Confirm.');
+  }
+
+  /**
+   * User confirm mode: the app has already confirmed each action with the
+   * user's own session token and passes the request sms-backend returned.
+   * sms-backend still checks it byte-for-byte against what was confirmed.
+   */
+  async execute(
+    conv: Conversation,
+    actions: { id: string; request: ActionRequest }[],
+    backend: SmsBackend,
+  ): Promise<ActionResult> {
+    const ids = actions.map((a) => a.id);
+    this.pendingIds(conv, ids);
+    const byId = new Map(actions.map((a) => [a.id, a.request]));
+    return this.run(
+      conv,
+      ids,
+      backend,
+      async (id) => ({ id, summary: '', status: 'CONFIRMED', request: byId.get(id)! }),
+      true,
+      'Confirm.',
+    );
+  }
+
+  private async run(
+    conv: Conversation,
+    ids: string[],
+    backend: SmsBackend,
+    prepare: (id: string) => Promise<{ summary: string; request: ActionRequest }>,
+    fromButton: boolean,
+    userSaid: string,
+  ): Promise<ActionResult> {
+    const summaries = new Map(
+      conv.pending.flatMap((d) => d.action_ids.map((id) => [id, d.summary] as const)),
+    );
+    const done: string[] = [];
+    const failed: string[] = [];
+    const doneIds: string[] = [];
+    const failedIds: string[] = [];
+    for (const id of ids) {
+      try {
+        const exec = await prepare(id);
+        await backend.execute(id, exec.request);
+        done.push(exec.summary || summaries.get(id) || 'Change saved.');
+        doneIds.push(id);
+      } catch (err) {
+        if (err instanceof BackendError && (err.status === 401 || err.status === 402)) {
+          throw err;
+        }
+        failed.push(err instanceof BackendError ? err.message : 'It could not be saved.');
+        failedIds.push(id);
+      }
+    }
+    this.markDrafts(conv, doneIds, 'done');
+    this.markDrafts(conv, failedIds, 'failed');
+    this.dropPending(conv, ids);
+
+    const uniq = (xs: string[]) => [...new Set(xs)].join(' ');
+    const doneText = uniq(done).replace(/Parents will be notified\./g, 'Parents have been notified.');
+    const outcome: ActionOutcome = failed.length ? (done.length ? 'partial' : 'failed') : 'done';
+    const text =
+      outcome === 'done'
+        ? `Done. ${doneText}`
+        : outcome === 'partial'
+          ? `Done: ${doneText} Not done: ${uniq(failed)}`
+          : `Not done: ${uniq(failed)}`;
+    if (fromButton) this.recordButton(conv, userSaid, text);
+    return { ok: outcome !== 'failed', outcome, text, actionIds: ids };
+  }
+
+  async cancel(
+    conv: Conversation,
+    ids: string[],
+    backend: SmsBackend,
+    fromButton = true,
+  ): Promise<ActionResult> {
+    this.pendingIds(conv, ids);
+    await Promise.all(ids.map((id) => backend.cancelAction(id).catch(() => undefined)));
+    this.markDrafts(conv, ids, 'cancelled');
+    this.dropPending(conv, ids);
+    const text = 'Cancelled. Nothing was changed.';
+    if (fromButton) this.recordButton(conv, 'Cancel.', text);
+    return { ok: true, outcome: 'cancelled', text, actionIds: ids };
+  }
+
+  /** So the model knows what happened when the conversation continues. */
+  private recordButton(conv: Conversation, userSaid: string, text: string) {
+    conv.history.push({ role: 'user', content: `(Pressed "${userSaid.replace('.', '')}" on the draft.)` });
+    conv.history.push({ role: 'assistant', content: text });
+    conv.transcript.push({ role: 'assistant', text, at: new Date().toISOString() });
+  }
+
+  private dropPending(conv: Conversation, ids: string[]) {
+    const gone = new Set(ids);
+    conv.pending = conv.pending
+      .map((d) => ({ ...d, action_ids: d.action_ids.filter((id) => !gone.has(id)) }))
+      .filter((d) => d.action_ids.length);
+  }
+
+  private markDrafts(
+    conv: Conversation,
+    ids: string[],
+    state: 'done' | 'cancelled' | 'failed',
+  ) {
+    if (!ids.length) return;
+    const set = new Set(ids);
+    for (const e of conv.transcript) {
+      for (const d of e.drafts ?? []) {
+        if (d.state === 'pending' && d.action_ids.some((id) => set.has(id))) {
+          d.state = state;
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,100 @@
+# sms-agent
+
+The AI Assistant for the school management system. Staff and admins chat or talk to it from the portal (sms-frontend). It answers with the school's own data through the [sms-mcp](../sms-mcp) tools, and it only changes records after the person confirms.
+
+```
+ portal (sms-frontend)
+   │ 1. POST {API_URL}/agent/session          user session → 30-min assistant token
+   │ 2. /v1/chat (SSE), /v1/actions/*, /v1/voice/*   Bearer <assistant token>
+   ▼
+ sms-agent ── OpenAI (chat model, speech) ── reports tokens / audio to sms-backend
+   │ MCP over HTTP, same token
+   ▼
+ sms-mcp ── sms-backend /agent/*  (permissions, school isolation, credits, confirmed writes)
+```
+
+The service keeps no secrets except the model provider key, and has no database. It decodes the assistant token only to know who is asking. Before any model call it asks sms-backend for the school's credits with the same token, and that request verifies the token, the school and the `ai_agent` feature. A forged or expired token therefore never reaches the model.
+
+## What a turn does
+
+1. **Plain yes or no?** If a draft is waiting and the message is only a yes or a no (English, Hindi or Hinglish, typed or spoken), the draft is confirmed or cancelled right away, without calling the model.
+2. **Credits check.** `GET /agent/quota`. When a school has no credits left, the turn stops before the model is called.
+3. **Model loop.** The model sees:
+   - the tools from sms-mcp, except `confirm_action`;
+   - a short fixed system prompt, then a context note with the user, the time in IST and the reply mode;
+   - the conversation history, trimmed to whole turns and a character budget.
+
+   It calls tools, possibly several in parallel, for up to `AGENT_MAX_TOOL_ROUNDS` rounds. Text streams to the app as it is written.
+4. **Drafts.** A `draft_*` result carries `structuredContent.draft`. The app shows it as a card with **Confirm and save** and **Cancel**. A new draft replaces the previous one, which is cancelled in sms-backend.
+5. **Metering.** The turn's tokens are reported to `POST /agent/usage/report`, with prompt-cache hits counted separately. The school's balance comes back to the app.
+
+**Why the model can't confirm.** Approval is always the person's own act: pressing a button, or saying a plain yes. That text never passes through the model. So wording hidden in the data (a student name, a leave reason) cannot talk the model into approving something. sms-backend then runs only the exact request that was confirmed, and only once.
+
+## API (all under `/v1`, `Authorization: Bearer <assistant token>`)
+
+| Route | Purpose |
+|---|---|
+| `GET /capabilities` | Credits left, confirm mode, whether server voice is available, limits. The app's first call. |
+| `POST /chat` `{ message, conversationId?, mode: 'text'｜'voice' }` | Server-sent events: `start`, `status` (tool in use), `token`, `draft`, `action` (a draft confirmed or cancelled by a plain yes/no), `usage`, `done`, `error`. |
+| `GET /conversations/:id` | The visible transcript and any pending drafts, used to restore the panel after a reload. |
+| `DELETE /conversations/:id` | Forget a conversation. Its pending drafts are cancelled. |
+| `POST /actions/confirm` `{ conversationId, actionIds }` | The Confirm button (confirm mode `agent`). |
+| `POST /actions/execute` `{ conversationId, actions: [{ id, request }] }` | Confirm mode `user`: the app has already confirmed with the person's own session. |
+| `POST /actions/cancel` `{ conversationId, actionIds }` | The Cancel button. |
+| `POST /voice/transcribe` (raw audio, `X-Audio-Duration-Ms`) | Speech to text, charged per second. |
+| `POST /voice/speak` `{ text }` | Text to speech (MP3), charged per character. |
+
+Error bodies are `{ code, message }`. `message` is written to be shown to the person. The codes are `SESSION_EXPIRED` (401: mint a new token and retry), `CREDITS_EXHAUSTED` (402), `FORBIDDEN` (403), `RATE_LIMITED` (429), `BUSY` (409), `VOICE_UNAVAILABLE` (503: use the browser's own speech) and `MODEL_UNAVAILABLE` / `TOOLS_UNAVAILABLE`.
+
+## Models
+
+| Use | Default | Setting |
+|---|---|---|
+| Chat with tools | `gpt-5.4-mini` | `AGENT_MODEL` |
+| Speech to text | `gpt-4o-mini-transcribe` | `AGENT_STT_MODEL` |
+| Text to speech | `gpt-4o-mini-tts` | `AGENT_TTS_MODEL`, `AGENT_TTS_VOICE` |
+
+`gpt-5.4-mini` on Chat Completions only accepts tools with `reasoning_effort: none`, which is the default here (`AGENT_REASONING_EFFORT`). If the provider key cannot use a speech model, the service marks voice unavailable for 10 minutes. The app then switches to the browser's own speech recognition and synthesis; nothing breaks.
+
+## Confirm modes
+
+- `AGENT_CONFIRM_MODE=agent` (default): this service confirms after the Confirm button or a plain yes.
+- `AGENT_CONFIRM_MODE=user`: stricter. It must be paired with `AGENT_CONFIRM_REQUIRES_USER_TOKEN=true` in sms-backend. The app confirms each draft with the person's own session (`POST {API_URL}/agent/actions/:id/confirm`) and passes the returned request to `/v1/actions/execute`. A spoken "yes" then only reminds the person to press Confirm.
+
+## Running
+
+```bash
+npm install
+cp .env.example .env         # set OPENAI_API_KEY; SMS_API_URL / SMS_MCP_URL if not local defaults
+npm run build && npm start   # http://127.0.0.1:4030
+npm run dev                  # watch mode
+npm test                     # vitest: unit + HTTP flows with a fake model, tools and backend
+```
+
+Local stack: sms-backend on 4010, sms-mcp on 4020, sms-agent on 4030. Start the portal with `AGENT_API_URL=http://localhost:4030`. `.env` is read at startup when present; variables already set in the environment win.
+
+**Docker:** `docker build -t sms-agent . && docker run -p 4030:4030 --env-file .env sms-agent`. The image listens on `0.0.0.0:4030`.
+
+## Operating notes
+
+- **Conversations** live in memory: 4 idle hours, 5 per person. They are not records. School data and drafts live in sms-backend, and losing a conversation only means starting a new one. With several instances, route each user to the same instance, or move `ConversationStore` to Redis.
+- **CORS** allows `AGENT_CORS_ORIGIN_REGEX`. The default covers `<slug>.localhost`, `*.appme.in` and `*.colegios.in`.
+- **Limits:** 30 messages per person per 5 minutes, 2,000 characters per message, 60-second voice clips.
+- **Cost, measured locally:** a turn with a tool call uses about 2–5 credits of model tokens, falling to about 2 once the prompt is cached, plus 1–3 credits for the tools. A plain yes or no costs only the write itself.
+
+## Layout
+
+```
+src/
+  index.ts      entry
+  http.ts       routes, SSE, CORS, auth, rate limit, voice endpoints
+  agent.ts      the turn loop, drafts, confirm / execute / cancel
+  llm.ts        OpenAI chat model (streaming, tool calls, usage)
+  mcp.ts        sms-mcp client, cached tool list per session
+  backend.ts    sms-backend calls: quota, usage reports, confirmed writes
+  intent.ts     plain yes / no detection
+  prompt.ts     system prompt and per-turn context
+  conversations.ts  in-memory store and history trimming
+  voice.ts      speech to text / text to speech
+test/           vitest
+```
