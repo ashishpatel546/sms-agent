@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { toModelTools } from '../src/agent.js';
+import { sealHistory, toModelTools } from '../src/agent.js';
 import { historyForModel } from '../src/conversations.js';
 import { speakable } from '../src/http.js';
 import { plainAnswer } from '../src/intent.js';
@@ -69,12 +69,34 @@ describe('historyForModel', () => {
 });
 
 describe('toModelTools', () => {
-  it('hides confirm_action from the model and strips $schema', () => {
+  it('hides confirm_action and cancel_action from the model and strips $schema', () => {
     const tools = toModelTools(TOOL_SPECS);
     const names = tools.map((t) => t.function.name);
     expect(names).not.toContain('confirm_action');
-    expect(names).toContain('cancel_action');
+    expect(names).not.toContain('cancel_action');
+    expect(names).toContain('draft_attendance');
     expect(tools[0]!.function.parameters).not.toHaveProperty('$schema');
+  });
+});
+
+describe('sealHistory', () => {
+  it('answers tool calls left without a result, in place', () => {
+    const h: Message[] = [
+      { role: 'user', content: 'q' },
+      {
+        role: 'assistant',
+        content: null,
+        tool_calls: [
+          { id: 'a', type: 'function', function: { name: 't', arguments: '{}' } },
+          { id: 'b', type: 'function', function: { name: 't', arguments: '{}' } },
+        ],
+      },
+      { role: 'tool', tool_call_id: 'a', content: 'ok' },
+    ];
+    sealHistory(h);
+    expect(h.map((m) => (m.role === 'tool' ? m.tool_call_id : m.role))).toEqual(['user', 'assistant', 'a', 'b']);
+    sealHistory(h);
+    expect(h).toHaveLength(4);
   });
 });
 

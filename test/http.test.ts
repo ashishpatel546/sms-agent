@@ -54,6 +54,29 @@ describe('auth', () => {
     expect(state.calls).toHaveLength(0);
   });
 
+  it('does not touch conversations or rate limits for a token the backend rejects', async () => {
+    state.tokenValid = false;
+    const model = new FakeModel([]);
+    const base = await app({ model });
+    for (let i = 0; i < 40; i++) {
+      const r = await chat(base, { message: 'hi' });
+      expect(r.status).toBe(401);
+    }
+    expect(model.requests).toHaveLength(0);
+    // The real owner is neither rate limited nor missing anything afterwards.
+    state.tokenValid = true;
+    const ok = await chat(base, { message: 'hi' });
+    expect(ok.status).toBe(200);
+  });
+
+  it('asks the backend once per token, not on every request', async () => {
+    const base = await app({ model: new FakeModel([{ content: 'a' }, { content: 'b' }]) });
+    await chat(base, { message: 'one' });
+    await chat(base, { message: 'two' });
+    // one verification + one pre-check per turn
+    expect(paths().filter((p) => p === 'GET /agent/quota')).toHaveLength(3);
+  });
+
   it('answers CORS preflight only for portal origins', async () => {
     const base = await app({ model: new FakeModel([]) });
     const ok = await fetch(`${base}/v1/chat`, {
@@ -144,6 +167,46 @@ describe('chat', () => {
       content: 'ERROR: Unknown tool confirm_action.',
     });
     expect(textOf(events)).toBe('I cannot confirm that myself.');
+  });
+});
+
+describe('resilience', () => {
+  it('keeps the conversation usable after the tool server fails mid-turn', async () => {
+    const model = new FakeModel([
+      { toolCalls: [{ name: 'daily_briefing', args: {} }] },
+      { content: 'Hello again.' },
+    ]);
+    const tools = new FakeTools();
+    let fail = true;
+    const { ToolServerError } = await import('../src/mcp.js');
+    tools.call = async () => {
+      if (fail) throw new ToolServerError(401, 'expired');
+      return { text: 'ok', isError: false };
+    };
+    const base = await app({ model, tools: () => tools });
+    const first = await chat(base, { message: 'today?' });
+    expect(first.events.find((e) => e.type === 'error')).toMatchObject({ code: 'SESSION_EXPIRED' });
+    fail = false;
+    const again = await chat(base, { conversationId: first.events[0]!.conversationId, message: 'hi' });
+    expect(textOf(again.events)).toBe('Hello again.');
+    // Every tool call in what the model saw has its result.
+    const sent = model.requests.at(-1)!.messages;
+    const calls = sent.flatMap((m) => (m.role === 'assistant' && m.tool_calls ? m.tool_calls.map((c) => c.id) : []));
+    const results = sent.filter((m) => m.role === 'tool').map((m) => (m as { tool_call_id: string }).tool_call_id);
+    expect(results).toEqual(expect.arrayContaining(calls));
+  });
+
+  it('tells the app when a plain "yes" could not save the draft', async () => {
+    state.writeStatus = 409;
+    const model = new FakeModel([
+      { toolCalls: [{ name: 'draft_attendance', args: { class: '6B' } }] },
+      { content: 'Save it?' },
+    ]);
+    const base = await app({ model });
+    const first = await chat(base, { message: 'mark 6B' });
+    const yes = await chat(base, { conversationId: first.events[0]!.conversationId, message: 'yes' });
+    expect(yes.events.find((e) => e.type === 'action')).toMatchObject({ ok: false, outcome: 'failed' });
+    expect(textOf(yes.events)).toContain('already marked');
   });
 });
 

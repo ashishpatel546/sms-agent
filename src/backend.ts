@@ -16,6 +16,8 @@ export interface Quota {
   limit: number;
   used: number;
   remaining: number;
+  /** sms-backend's AGENT_CONFIRM_REQUIRES_USER_TOKEN: only the app may confirm. */
+  confirmRequiresUserToken?: boolean;
 }
 
 export interface HostUsage {

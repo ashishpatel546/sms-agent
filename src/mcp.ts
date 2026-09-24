@@ -153,8 +153,8 @@ export class McpTools implements ToolSource {
   }
 
   async call(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
-    const client = await this.connect();
     try {
+      const client = await this.connect();
       const res = await client.callTool({ name, arguments: args });
       const text = (res.content as { type: string; text?: string }[])
         .filter((c) => c.type === 'text')
@@ -164,9 +164,10 @@ export class McpTools implements ToolSource {
         ?.draft;
       return { text, isError: res.isError === true, draft };
     } catch (err) {
-      const status = errorStatus(err);
-      if (status === 401) throw new ToolServerError(401, errorMessage(err));
-      return { text: errorMessage(err), isError: true };
+      const status = err instanceof ToolServerError ? err.status : errorStatus(err);
+      const message = err instanceof ToolServerError ? err.message : errorMessage(err);
+      if (status === 401 || status === 402) throw new ToolServerError(status, message);
+      return { text: message, isError: true };
     }
   }
 

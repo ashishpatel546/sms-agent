@@ -151,6 +151,10 @@ export interface BackendCall {
 export interface BackendState {
   remaining: number;
   calls: BackendCall[];
+  /** false: sms-backend rejects the token (forged or revoked). */
+  tokenValid?: boolean;
+  /** Status the write route answers with (default 201). */
+  writeStatus?: number;
 }
 
 /** Routes fetch() to a fake sms-backend. */
@@ -166,6 +170,7 @@ export function fakeBackend(state: BackendState) {
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
     const quota = { month: '2026-09', limit: 500, used: 500 - state.remaining, remaining: state.remaining };
+    if (state.tokenValid === false) return json({ message: 'Unauthorized' }, 401);
 
     if (url.pathname === '/agent/quota') return json(quota);
     if (url.pathname === '/agent/usage/report') return json({ credits: 3, quota });
@@ -179,7 +184,11 @@ export function fakeBackend(state: BackendState) {
         request: { method: 'POST', path: '/attendance', body: { date: '2026-09-24', classId: 9 } },
       });
     }
-    if (url.pathname === '/attendance' && method === 'POST') return json({ id: 5 }, 201);
+    if (url.pathname === '/attendance' && method === 'POST') {
+      return (state.writeStatus ?? 201) < 300
+        ? json({ id: 5 }, 201)
+        : json({ message: 'Attendance for this class is already marked.' }, state.writeStatus);
+    }
     return json({ message: 'not found' }, 404);
   });
 }

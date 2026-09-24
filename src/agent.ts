@@ -16,7 +16,13 @@ import {
   type ModelTool,
   type TokenUsage,
 } from './llm.js';
-import { ToolServerError, type DraftInfo, type ToolSource, type ToolSpec } from './mcp.js';
+import {
+  ToolServerError,
+  type DraftInfo,
+  type ToolOutcome,
+  type ToolSource,
+  type ToolSpec,
+} from './mcp.js';
 import { BASE_PROMPT, contextMessage, type ReplyMode } from './prompt.js';
 
 /** Streamed to the app as server-sent events, in this order. */
@@ -26,7 +32,14 @@ export type AgentEvent =
   | { type: 'token'; text: string }
   | { type: 'draft'; drafts: DraftInfo[] }
   | { type: 'action'; ok: boolean; text: string; actionIds: string[]; outcome: ActionOutcome }
-  | { type: 'usage'; credits: number; remaining: number; limit: number }
+  | {
+      type: 'usage';
+      credits: number;
+      remaining: number;
+      limit: number;
+      /** Model tokens this turn: uncached input, cached input, output. */
+      tokens: TokenUsage;
+    }
   | { type: 'done'; text: string }
   | { type: 'error'; code: ErrorCode; message: string };
 
@@ -48,12 +61,13 @@ export interface ActionResult {
 }
 
 /**
- * The model never sees confirm_action: approving a change is the user's
+ * The model never sees confirm_action or cancel_action: approving (or
+ * discarding) a change is the user's
  * act — a Confirm button, or a plain "yes" recognised by intent.ts — and this
  * service carries it out. A model misled by text inside the data therefore
  * cannot approve anything.
  */
-const HOST_ONLY_TOOLS = new Set(['confirm_action']);
+const HOST_ONLY_TOOLS = new Set(['confirm_action', 'cancel_action']);
 
 export class AgentFailure extends Error {
   constructor(
@@ -103,6 +117,38 @@ export function toModelTools(tools: ToolSpec[]): ModelTool[] {
 function statusLabel(tool: ToolSpec | undefined, name: string): string {
   const title = tool?.title ?? name.replace(/_/g, ' ');
   return name.startsWith('draft_') ? `Preparing: ${title}` : `Checking: ${title}`;
+}
+
+/** Rough token count (≈4 characters per token) for a round that never reported usage. */
+function estimateUsage(messages: Message[], tools: ModelTool[], outputChars: number): TokenUsage {
+  const promptChars = JSON.stringify(messages).length + JSON.stringify(tools).length;
+  return { input: Math.ceil(promptChars / 4), cached: 0, output: Math.ceil(outputChars / 4) };
+}
+
+/**
+ * After an interrupted turn, give any tool call left without a result a
+ * placeholder one: the provider rejects a history with an unanswered call,
+ * which would break every later message in the conversation.
+ */
+export function sealHistory(history: Message[]) {
+  const answered = new Set(
+    history.filter((m) => m.role === 'tool').map((m) => (m as { tool_call_id: string }).tool_call_id),
+  );
+  for (let i = history.length - 1; i >= 0; i--) {
+    const m = history[i]!;
+    if (m.role === 'user') break;
+    if (m.role !== 'assistant' || !m.tool_calls?.length) continue;
+    const missing = m.tool_calls.filter((c) => !answered.has(c.id));
+    history.splice(
+      i + 1 + m.tool_calls.length - missing.length,
+      0,
+      ...missing.map((c) => ({
+        role: 'tool' as const,
+        tool_call_id: c.id,
+        content: 'ERROR: interrupted before this ran.',
+      })),
+    );
+  }
 }
 
 function isLive(d: DraftInfo, now = Date.now()) {
@@ -166,18 +212,30 @@ export class Agent {
           text += '\n\n';
           emit({ type: 'token', text: '\n\n' });
         }
-        const reply = await this.model.complete(
-          {
-            messages,
-            tools: modelTools,
-            cacheKey: `sms-agent:${input.claims.schoolId}:${input.claims.role}`,
-            signal: input.signal,
-          },
-          (delta) => {
-            text += delta;
-            emit({ type: 'token', text: delta });
-          },
-        );
+        let streamed = 0;
+        let reply;
+        try {
+          reply = await this.model.complete(
+            {
+              messages,
+              tools: modelTools,
+              cacheKey: `sms-agent:${input.claims.schoolId}:${input.claims.role}`,
+              signal: input.signal,
+            },
+            (delta) => {
+              streamed += delta.length;
+              text += delta;
+              emit({ type: 'token', text: delta });
+            },
+          );
+        } catch (err) {
+          // A round cut off mid-stream is still billed by the provider, but
+          // its usage figures never arrive: charge an estimate instead.
+          if (input.signal?.aborted || streamed > 0) {
+            usage = addUsage(usage, estimateUsage(messages, modelTools, streamed));
+          }
+          throw err;
+        }
         usage = addUsage(usage, reply.usage);
 
         const assistant: Message = reply.toolCalls.length
@@ -201,8 +259,9 @@ export class Agent {
         for (const call of reply.toolCalls) {
           emit({ type: 'status', tool: call.name, label: statusLabel(byName.get(call.name), call.name) });
         }
+        let fatal: unknown = null;
         const results = await Promise.all(
-          reply.toolCalls.map(async (call) => {
+          reply.toolCalls.map(async (call): Promise<ToolOutcome> => {
             if (!allowed.has(call.name)) {
               return { text: `Unknown tool ${call.name}.`, isError: true };
             }
@@ -212,7 +271,12 @@ export class Agent {
             } catch {
               return { text: 'Invalid tool arguments (not JSON).', isError: true };
             }
-            return input.tools.call(call.name, args);
+            try {
+              return await input.tools.call(call.name, args);
+            } catch (err) {
+              fatal ??= err;
+              return { text: 'Not run: the session ended.', isError: true };
+            }
           }),
         );
         reply.toolCalls.forEach((call, i) => {
@@ -227,6 +291,8 @@ export class Agent {
           messages.push(toolMsg);
           conv.history.push(toolMsg);
         });
+        // Every tool call now has its result, so the history stays valid.
+        if (fatal) throw fatal;
       }
 
       if (!finished) {
@@ -253,6 +319,7 @@ export class Agent {
       emit({ type: 'error', code: f.code, message: f.message });
       entry.text = f.message;
     } finally {
+      sealHistory(conv.history);
       entry.at = new Date().toISOString();
       if (entry.text) conv.transcript.push(entry);
       await this.reportUsage(input, usage);
@@ -275,6 +342,7 @@ export class Agent {
         credits: r.credits,
         remaining: r.quota.remaining,
         limit: r.quota.limit,
+        tokens: usage,
       });
     } catch (err) {
       console.error('[sms-agent] usage report failed', (err as Error).message);
@@ -333,9 +401,7 @@ export class Agent {
     conv.history.push({ role: 'user', content: input.message });
     conv.history.push({ role: 'assistant', content: result.text });
     conv.transcript.push({ role: 'assistant', text: result.text, at: new Date().toISOString() });
-    if (result.actionIds.length && result.outcome !== 'failed') {
-      emit({ type: 'action', ...result });
-    }
+    if (result.actionIds.length) emit({ type: 'action', ...result });
     emit({ type: 'token', text: result.text });
     emit({ type: 'done', text: result.text });
     return true;
@@ -410,6 +476,9 @@ export class Agent {
         doneIds.push(id);
       } catch (err) {
         if (err instanceof BackendError && (err.status === 401 || err.status === 402)) {
+          // Keep what already ran marked as done before giving up.
+          this.markDrafts(conv, doneIds, 'done');
+          this.dropPending(conv, doneIds);
           throw err;
         }
         failed.push(err instanceof BackendError ? err.message : 'It could not be saved.');

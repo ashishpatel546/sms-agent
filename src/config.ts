@@ -17,7 +17,11 @@ export interface Config {
   openaiApiKey: string;
   /** Chat model with tool calling. */
   model: string;
-  reasoningEffort: 'none' | 'low' | 'medium' | 'high';
+  /**
+   * Which values work depends on the model: gpt-5.4-* accept tools only with
+   * `none`; gpt-5 / gpt-5-mini / gpt-5-nano need `minimal` or higher.
+   */
+  reasoningEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high';
   maxOutputTokens: number;
   /** Model/tool rounds per user message before the assistant gives up. */
   maxToolRounds: number;
@@ -88,10 +92,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     corsOriginRegex: new RegExp(env.AGENT_CORS_ORIGIN_REGEX || DEFAULT_ORIGINS),
 
     openaiApiKey: env.OPENAI_API_KEY ?? '',
-    model: env.AGENT_MODEL || 'gpt-5.4-mini',
+    model: env.AGENT_MODEL || 'gpt-5.4-nano',
     reasoningEffort: oneOf(
       env.AGENT_REASONING_EFFORT,
-      ['none', 'low', 'medium', 'high'] as const,
+      ['none', 'minimal', 'low', 'medium', 'high'] as const,
       // gpt-5.4-mini on Chat Completions accepts tools only without reasoning.
       'none',
     ),

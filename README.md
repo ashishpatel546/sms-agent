@@ -50,11 +50,30 @@ Error bodies are `{ code, message }`. `message` is written to be shown to the pe
 
 | Use | Default | Setting |
 |---|---|---|
-| Chat with tools | `gpt-5.4-mini` | `AGENT_MODEL` |
+| Chat with tools | `gpt-5.4-nano` | `AGENT_MODEL` |
 | Speech to text | `gpt-4o-mini-transcribe` | `AGENT_STT_MODEL` |
 | Text to speech | `gpt-4o-mini-tts` | `AGENT_TTS_MODEL`, `AGENT_TTS_VOICE` |
 
-`gpt-5.4-mini` on Chat Completions only accepts tools with `reasoning_effort: none`, which is the default here (`AGENT_REASONING_EFFORT`). If the provider key cannot use a speech model, the service marks voice unavailable for 10 minutes. The app then switches to the browser's own speech recognition and synthesis; nothing breaks.
+**Choosing the chat model.** On 24 Sep 2026 each model ran the same 15 staff tasks twice, against the local school. The tasks covered:
+- the day's briefing, class absentees and low attendance;
+- drafting attendance, homework, leave in Hinglish, and a leave decision;
+- own leave balance, a student's attendance, and admin fee dues;
+- refusing a payment and an off-topic question;
+- resisting a prompt injection;
+- a Hinglish voice question;
+- a follow-up question.
+
+A task passed when the right tool was called, the draft was correct, or the refusal held.
+
+| Model (reasoning) | Passed | Avg time | Cost per 1,000 questions |
+|---|---|---|---|
+| gpt-5.4-mini (none) | 30/30 | 2.5 s | $1.26 |
+| **gpt-5.4-nano (none)**, default | 30/30 | 2.3 s | $0.50 |
+| gpt-4.1-nano | 30/30, 29/30 on the run before | 2.0 s | $0.22 |
+| gpt-5-mini (minimal) | 28/30 | 4.8 s | $0.65 |
+| gpt-5-nano (minimal) | 25/30: asks needless questions instead of calling tools | 2.9 s | $0.11 |
+
+Costs use the prices in school-ai's `llm_model_pricing`, with prompt-cache hits billed at the cached rate. `gpt-5.4-*` models only accept tools with `reasoning_effort: none`; `gpt-5`, `gpt-5-mini` and `gpt-5-nano` need `minimal` or higher (`AGENT_REASONING_EFFORT`); `gpt-4.1-*` takes no reasoning setting, and none is sent. If the provider key cannot use a speech model, the service marks voice unavailable for 10 minutes. The app then switches to the browser's own speech recognition and synthesis; nothing breaks.
 
 ## Confirm modes
 

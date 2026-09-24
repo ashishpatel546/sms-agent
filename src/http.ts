@@ -1,7 +1,8 @@
+import { createHash } from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { Agent, toFailure, type AgentEvent, type ErrorCode } from './agent.js';
-import { SmsBackend } from './backend.js';
+import { SmsBackend, type Quota } from './backend.js';
 import { bearer, ownerKey, requireAgentClaims, TokenError, type AgentClaims } from './claims.js';
 import type { Config } from './config.js';
 import { ConversationStore, type Conversation } from './conversations.js';
@@ -108,6 +109,29 @@ export function createApp(deps: AppDeps) {
       new McpTools(config.mcpUrl, token, claims, catalogs, config.mcpKey));
   const limiter = new RateLimiter(config.rateLimit, config.rateWindowMs);
 
+  /**
+   * Tokens sms-backend has accepted, by hash, until they expire. The token is
+   * only decoded here, so nothing — rate-limit counters, conversations — is
+   * touched for it until the backend has verified it once.
+   */
+  const verified = new Map<string, number>();
+  const isVerified = (key: string) => (verified.get(key) ?? 0) > Date.now();
+  const markVerified = (key: string, claims: AgentClaims) => {
+    if (verified.size > 20_000) {
+      const now = Date.now();
+      for (const [k, exp] of verified) if (exp <= now) verified.delete(k);
+      if (verified.size > 20_000) verified.clear();
+    }
+    verified.set(key, claims.exp ? claims.exp * 1000 : Date.now() + 5 * 60_000);
+  };
+
+  /** sms-backend decides who confirms; AGENT_CONFIRM_MODE is only the fallback. */
+  const syncConfirmMode = (q: Quota) => {
+    if (typeof q.confirmRequiresUserToken === 'boolean') {
+      config.confirmMode = q.confirmRequiresUserToken ? 'user' : 'agent';
+    }
+  };
+
   const app = express();
   app.disable('x-powered-by');
   app.set('trust proxy', true);
@@ -139,23 +163,36 @@ export function createApp(deps: AppDeps) {
 
   const v1 = express.Router();
 
-  v1.use((req: Request, res: Response, next: NextFunction) => {
+  v1.use(async (req: Request, res: Response, next: NextFunction) => {
     const token = bearer(req.headers.authorization);
+    let claims: AgentClaims;
     try {
-      const claims = requireAgentClaims(token);
-      const session: Session = {
-        token,
-        claims,
-        owner: ownerKey(claims),
-        backend: new SmsBackend(config.smsApiUrl, token, claims.slug, config.requestTimeoutMs),
-      };
-      res.locals.session = session;
-      next();
+      claims = requireAgentClaims(token);
     } catch (err) {
       const message = err instanceof TokenError ? err.message : 'Unauthorized.';
       res.setHeader('WWW-Authenticate', 'Bearer');
-      fail(res, 401, 'SESSION_EXPIRED', message);
+      return fail(res, 401, 'SESSION_EXPIRED', message);
     }
+    const session: Session = {
+      token,
+      claims,
+      owner: ownerKey(claims),
+      backend: new SmsBackend(config.smsApiUrl, token, claims.slug, config.requestTimeoutMs),
+    };
+    const key = createHash('sha256').update(token).digest('hex');
+    if (!isVerified(key)) {
+      try {
+        const quota = await session.backend.quota();
+        syncConfirmMode(quota);
+        markVerified(key, claims);
+        res.locals.quota = quota;
+      } catch (err) {
+        if ((err as { status?: number }).status === 401) res.setHeader('WWW-Authenticate', 'Bearer');
+        return failWith(res, err);
+      }
+    }
+    res.locals.session = session;
+    next();
   });
 
   const sessionOf = (res: Response) => res.locals.session as Session;
@@ -171,9 +208,10 @@ export function createApp(deps: AppDeps) {
   // Also the app's first call: it checks the token and the school's
   // assistant access with sms-backend, and returns the credits left.
   v1.get('/capabilities', async (_req, res) => {
-    let quota;
+    let quota = res.locals.quota as Quota | undefined;
     try {
-      quota = await sessionOf(res).backend.quota();
+      quota ??= await sessionOf(res).backend.quota();
+      syncConfirmMode(quota);
     } catch (err) {
       return failWith(res, err);
     }

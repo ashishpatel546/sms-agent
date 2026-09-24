@@ -55,6 +55,8 @@ export function addUsage(a: TokenUsage, b: TokenUsage): TokenUsage {
   };
 }
 
+export const isReasoningModel = (model: string) => /^(gpt-5|o\d)/.test(model);
+
 /** OpenAI Chat Completions with streaming text and tool calls. */
 export class OpenAiChatModel implements ChatModel {
   private readonly client: OpenAI;
@@ -81,7 +83,10 @@ export class OpenAiChatModel implements ChatModel {
           messages: req.messages,
           tools: req.tools.length ? req.tools : undefined,
           parallel_tool_calls: req.tools.length ? true : undefined,
-          reasoning_effort: this.config.reasoningEffort,
+          // Only reasoning models (gpt-5*, o-series) accept this parameter.
+          ...(isReasoningModel(this.config.model)
+            ? { reasoning_effort: this.config.reasoningEffort }
+            : {}),
           max_completion_tokens: this.config.maxOutputTokens,
           prompt_cache_key: req.cacheKey,
           stream: true,
