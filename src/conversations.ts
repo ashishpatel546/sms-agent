@@ -28,6 +28,13 @@ export interface Conversation {
 /**
  * Conversations in memory, per person, forgotten after an idle period.
  *
+ * A conversation is the assistant session sms-backend started for it — its
+ * id is the token's `agentSessionId`. sms-backend decides when a session is
+ * over (a new chat, or idle past AGENT_SESSION_IDLE_MINUTES) and then refuses
+ * its tokens; the app then gets a new session, and so a new conversation.
+ * The idle limit here only frees memory, so it runs a little past the
+ * backend's.
+ *
  * Kept in process on purpose for phase 1: nothing here is a record — school
  * data lives in sms-backend, drafts are stored there too, and a lost
  * conversation only means the user starts a new one. Several instances need
@@ -37,7 +44,7 @@ export class ConversationStore {
   private readonly items = new Map<string, Conversation>();
 
   constructor(
-    private readonly ttlMs: number,
+    private readonly ttlMs: () => number,
     private readonly maxPerOwner: number,
   ) {}
 
@@ -45,14 +52,15 @@ export class ConversationStore {
     if (!id) return undefined;
     const c = this.items.get(id);
     if (!c || c.owner !== owner) return undefined;
-    if (Date.now() - c.updatedAt > this.ttlMs) {
+    if (Date.now() - c.updatedAt > this.ttlMs()) {
       this.items.delete(id);
       return undefined;
     }
     return c;
   }
 
-  create(owner: string): Conversation {
+  /** `id`: the assistant session this conversation belongs to. */
+  create(owner: string, id: string = randomUUID()): Conversation {
     this.sweep();
     const mine = [...this.items.values()]
       .filter((c) => c.owner === owner)
@@ -63,7 +71,7 @@ export class ConversationStore {
     }
     const now = Date.now();
     const c: Conversation = {
-      id: randomUUID(),
+      id,
       owner,
       createdAt: now,
       updatedAt: now,
@@ -89,7 +97,7 @@ export class ConversationStore {
   private sweep() {
     const now = Date.now();
     for (const [id, c] of this.items) {
-      if (now - c.updatedAt > this.ttlMs) this.items.delete(id);
+      if (now - c.updatedAt > this.ttlMs()) this.items.delete(id);
     }
   }
 }
@@ -106,21 +114,32 @@ function size(m: Message): number {
   return n + 20;
 }
 
-/**
- * The history to send: whole turns only (a turn starts at a user message, so
- * a tool call is never separated from its result), newest first until the
- * character budget is spent. Tool results older than the last two turns are
- * cut to their summary line — the model rarely needs them verbatim again.
- */
-export function historyForModel(history: Message[], budgetChars: number): Message[] {
+/** Splits history into turns; a turn starts at a user message. */
+function turnsOf(history: Message[]): Message[][] {
   const turns: Message[][] = [];
   for (const m of history) {
     if (m.role === 'user' || turns.length === 0) turns.push([]);
     turns[turns.length - 1]!.push(m);
   }
+  return turns;
+}
+
+/**
+ * The history to send: whole turns only (so a tool call is never separated
+ * from its result), at most `maxTurns` of them, newest first until the
+ * character budget is spent. The current message counts as a turn. Tool
+ * results older than the last two turns are cut to their summary line — the
+ * model rarely needs them verbatim again.
+ */
+export function historyForModel(
+  history: Message[],
+  budgetChars: number,
+  maxTurns = Number.POSITIVE_INFINITY,
+): Message[] {
+  const turns = turnsOf(history);
   const kept: Message[][] = [];
   let used = 0;
-  for (let i = turns.length - 1; i >= 0; i--) {
+  for (let i = turns.length - 1; i >= 0 && kept.length < maxTurns; i--) {
     const recent = turns.length - 1 - i < 2;
     const turn = recent
       ? turns[i]!
@@ -137,4 +156,15 @@ export function historyForModel(history: Message[], budgetChars: number): Messag
     used += cost;
   }
   return kept.flat();
+}
+
+/**
+ * Drops turns the model will never be sent again, so a long conversation
+ * does not grow without bound in memory. Keeps the latest `keepTurns`.
+ */
+export function trimHistory(history: Message[], keepTurns: number): void {
+  const turns = turnsOf(history);
+  if (turns.length <= keepTurns) return;
+  const drop = turns.slice(0, turns.length - keepTurns).reduce((n, t) => n + t.length, 0);
+  history.splice(0, drop);
 }

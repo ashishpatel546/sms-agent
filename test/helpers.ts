@@ -21,7 +21,7 @@ export function claims(over: Partial<AgentClaims> = {}): AgentClaims {
     schoolId: 3,
     slug: 'edusphere',
     agent: true,
-    agentSessionId: 'sess-1',
+    agentSessionId: '33333333-3333-4333-8333-333333333333',
     agentScopes: ['read', 'write'],
     exp: Math.floor(Date.now() / 1000) + 1800,
     ...over,
@@ -155,6 +155,10 @@ export interface BackendState {
   tokenValid?: boolean;
   /** Status the write route answers with (default 201). */
   writeStatus?: number;
+  /** The model chosen in the hub, as /agent/quota reports it. */
+  model?: string | null;
+  /** true: the assistant session ended (new chat or idle). */
+  sessionEnded?: boolean;
 }
 
 /** Routes fetch() to a fake sms-backend. */
@@ -169,8 +173,23 @@ export function fakeBackend(state: BackendState) {
     state.calls.push({ method, path: url.pathname, body, headers });
     const json = (data: unknown, status = 200) =>
       new Response(JSON.stringify(data), { status, headers: { 'content-type': 'application/json' } });
-    const quota = { month: '2026-09', limit: 500, used: 500 - state.remaining, remaining: state.remaining };
+    const quota = {
+      month: '2026-09',
+      limit: 500,
+      used: 500 - state.remaining,
+      remaining: state.remaining,
+      model: state.model ?? null,
+      reasoningEffort: null,
+      sessionIdleMinutes: 30,
+    };
     if (state.tokenValid === false) return json({ message: 'Unauthorized' }, 401);
+    if (state.sessionEnded) {
+      return json({ code: 'AGENT_SESSION_ENDED', message: 'This assistant conversation has ended.' }, 401);
+    }
+    if (url.pathname === '/agent/session/end') {
+      state.sessionEnded = true;
+      return json({ ended: true });
+    }
 
     if (url.pathname === '/agent/quota') return json(quota);
     if (url.pathname === '/agent/usage/report') return json({ credits: 3, quota });

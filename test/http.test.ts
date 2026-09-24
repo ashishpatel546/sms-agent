@@ -350,3 +350,66 @@ describe('voice', () => {
     expect(r.json.code).toBe('VOICE_UNAVAILABLE');
   });
 });
+
+describe('sessions and model choice', () => {
+  it('answers with the model chosen in the hub and bills that model', async () => {
+    state.model = 'gpt-5.4-nano';
+    const model = new FakeModel([{ content: 'Hi.' }]);
+    const base = await app({ model });
+    await chat(base, { message: 'hello' });
+    expect(model.requests[0]!.model).toEqual({ name: 'gpt-5.4-nano', reasoningEffort: null });
+    const report = state.calls.find((c) => c.path === '/agent/usage/report');
+    expect(report?.body).toMatchObject({ model: 'gpt-5.4-nano' });
+  });
+
+  it('uses its own default model when the hub has not chosen one', async () => {
+    const model = new FakeModel([{ content: 'Hi.' }]);
+    const base = await app({ model });
+    await chat(base, { message: 'hello' });
+    expect(model.requests[0]!.model).toBeUndefined();
+  });
+
+  it('keeps one conversation per assistant session', async () => {
+    const model = new FakeModel([{ content: 'One.' }, { content: 'Two.' }]);
+    const base = await app({ model });
+    const a = await chat(base, { message: 'first' });
+    // An app that forgot the id still lands in the same conversation.
+    const b = await chat(base, { message: 'second' });
+    expect(a.events[0]!.conversationId).toBe(claims().agentSessionId);
+    expect(b.events[0]!.conversationId).toBe(claims().agentSessionId);
+    expect(model.requests[1]!.messages.some((m) => m.content === 'first')).toBe(true);
+  });
+
+  it('new chat ends the backend session; its token then stops working', async () => {
+    const model = new FakeModel([{ content: 'Hi.' }]);
+    const base = await app({ model });
+    const first = await chat(base, { message: 'hello' });
+    const id = first.events[0]!.conversationId;
+    const del = await fetch(`${base}/v1/conversations/${id}`, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${token()}` },
+    });
+    expect(del.status).toBe(204);
+    expect(paths()).toContain('POST /agent/session/end');
+    const after = await chat(base, { message: 'again' });
+    expect(after.status).toBe(401);
+  });
+
+  it('says so when the session ended while idle', async () => {
+    const model = new FakeModel([{ content: 'Hi.' }]);
+    const base = await app({ model });
+    await chat(base, { message: 'hello' });
+    state.sessionEnded = true;
+    const r = await chat(base, { message: 'still there?' });
+    expect(r.events.find((e) => e.type === 'error')).toMatchObject({ code: 'SESSION_ENDED' });
+    expect(model.requests).toHaveLength(1);
+  });
+
+  it('sends the model at most AGENT_HISTORY_MAX_TURNS earlier exchanges', async () => {
+    const model = new FakeModel([]);
+    const base = await app({ model, config: testConfig({ historyMaxTurns: 2 }) });
+    for (const q of ['q1', 'q2', 'q3', 'q4']) await chat(base, { message: q });
+    const sent = model.requests.at(-1)!.messages.filter((m) => m.role === 'user').map((m) => m.content);
+    expect(sent).toEqual(['q2', 'q3', 'q4']);
+  });
+});

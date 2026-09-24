@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { sealHistory, toModelTools } from '../src/agent.js';
-import { historyForModel } from '../src/conversations.js';
+import { historyForModel, trimHistory } from '../src/conversations.js';
 import { speakable } from '../src/http.js';
 import { plainAnswer } from '../src/intent.js';
 import type { Message } from '../src/llm.js';
@@ -62,6 +62,18 @@ describe('historyForModel', () => {
     expect(tools[2]!.length).toBe(500);
   });
 
+  it('keeps at most maxTurns turns', () => {
+    const out = historyForModel([...turn(1), ...turn(2), ...turn(3)], 100_000, 2);
+    expect(out.filter((m) => m.role === 'user').map((m) => m.content)).toEqual(['question 2', 'question 3']);
+  });
+
+  it('trimHistory drops whole old turns in place', () => {
+    const h = [...turn(1), ...turn(2), ...turn(3)];
+    trimHistory(h, 2);
+    expect(h).toHaveLength(8);
+    expect(h[0]).toMatchObject({ role: 'user', content: 'question 2' });
+  });
+
   it('always keeps the latest turn even if it alone is over budget', () => {
     const out = historyForModel(turn(1, 'y'.repeat(5000)), 100);
     expect(out).toHaveLength(4);
@@ -117,6 +129,7 @@ describe('contextMessage', () => {
     const m = contextMessage(claims({ agentScopes: ['read'] }), 'voice', 'Tools for X.', new Date('2026-09-24T03:00:00Z'));
     expect(m).toContain('Asha Verma (TEACHER)');
     expect(m).toContain('Thursday');
+    expect(m).toContain('tomorrow Fri 25 Sep; day after tomorrow Sat 26 Sep; yesterday Wed 23 Sep');
     expect(m).toContain('read-only');
     expect(m).toContain('Voice mode');
     expect(m).toContain('Tools for X.');

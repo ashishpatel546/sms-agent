@@ -26,6 +26,16 @@ export interface ModelTurn {
   content: string;
   toolCalls: ToolCall[];
   usage: TokenUsage;
+  /** The model that answered (may differ from the one asked for). */
+  model?: string;
+}
+
+export type ReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high';
+
+/** A model chosen for this request (the hub's choice via sms-backend). */
+export interface ModelChoice {
+  name: string;
+  reasoningEffort?: ReasoningEffort | null;
 }
 
 export interface ModelRequest {
@@ -33,6 +43,8 @@ export interface ModelRequest {
   tools: ModelTool[];
   /** Routes requests with the same prefix to the same prompt cache. */
   cacheKey: string;
+  /** Overrides AGENT_MODEL for this request. */
+  model?: ModelChoice;
   signal?: AbortSignal;
 }
 
@@ -75,17 +87,21 @@ export class OpenAiChatModel implements ChatModel {
     req: ModelRequest,
     onText: (delta: string) => void,
   ): Promise<ModelTurn> {
-    let stream;
-    try {
-      stream = await this.client.chat.completions.create(
+    const fallback: ModelChoice = {
+      name: this.config.model,
+      reasoningEffort: this.config.reasoningEffort,
+    };
+    let choice = req.model ?? fallback;
+    const open = (c: ModelChoice) =>
+      this.client.chat.completions.create(
         {
-          model: this.config.model,
+          model: c.name,
           messages: req.messages,
           tools: req.tools.length ? req.tools : undefined,
           parallel_tool_calls: req.tools.length ? true : undefined,
           // Only reasoning models (gpt-5*, o-series) accept this parameter.
-          ...(isReasoningModel(this.config.model)
-            ? { reasoning_effort: this.config.reasoningEffort }
+          ...(isReasoningModel(c.name)
+            ? { reasoning_effort: c.reasoningEffort ?? this.config.reasoningEffort }
             : {}),
           max_completion_tokens: this.config.maxOutputTokens,
           prompt_cache_key: req.cacheKey,
@@ -94,8 +110,23 @@ export class OpenAiChatModel implements ChatModel {
         },
         { signal: req.signal },
       );
+    let stream;
+    try {
+      stream = await open(choice);
     } catch (err) {
-      throw toModelError(err);
+      // A model chosen in the hub that this API key cannot use (or that
+      // rejects a parameter) must not take the assistant down: answer with
+      // the host's own model instead, and say so in the log.
+      if (!isModelRejection(err) || choice.name === fallback.name) throw toModelError(err);
+      console.error(
+        `[sms-agent] model ${choice.name} refused (${(err as { status?: number }).status}); using ${fallback.name}`,
+      );
+      choice = fallback;
+      try {
+        stream = await open(choice);
+      } catch (err2) {
+        throw toModelError(err2);
+      }
     }
 
     let content = '';
@@ -132,8 +163,14 @@ export class OpenAiChatModel implements ChatModel {
         .sort(([a], [b]) => a - b)
         .map(([, c]) => c),
       usage,
+      model: choice.name,
     };
   }
+}
+
+/** The provider refused the model or its settings (not a transient failure). */
+function isModelRejection(err: unknown): boolean {
+  return err instanceof OpenAI.APIError && [400, 403, 404].includes(err.status ?? 0);
 }
 
 function toModelError(err: unknown): Error {

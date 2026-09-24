@@ -15,7 +15,10 @@ export interface Config {
   corsOriginRegex: RegExp;
 
   openaiApiKey: string;
-  /** Chat model with tool calling. */
+  /**
+   * Chat model with tool calling — the default. A model chosen in the hub
+   * (sms-backend's agent settings) takes precedence, message by message.
+   */
   model: string;
   /**
    * Which values work depends on the model: gpt-5.4-* accept tools only with
@@ -44,11 +47,20 @@ export interface Config {
   confirmMode: 'agent' | 'user';
 
   maxMessageChars: number;
-  /** Idle time after which a conversation is forgotten. */
+  /**
+   * Idle time after which a conversation is over. sms-backend's
+   * AGENT_SESSION_IDLE_MINUTES decides it (synced from /agent/quota); this
+   * is only the value used until then.
+   */
   conversationTtlMs: number;
   /** Conversations kept per user; the oldest is dropped beyond this. */
   maxConversationsPerUser: number;
-  /** Characters of history sent to the model (older turns are dropped). */
+  /**
+   * Earlier exchanges (a question and its answer, with any tool calls) the
+   * model sees with each new message. Older ones are dropped.
+   */
+  historyMaxTurns: number;
+  /** Characters of history sent to the model — a cap on top of the turns. */
   historyBudgetChars: number;
   /** Characters of one tool result kept for the model. */
   toolResultMaxChars: number;
@@ -92,11 +104,12 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     corsOriginRegex: new RegExp(env.AGENT_CORS_ORIGIN_REGEX || DEFAULT_ORIGINS),
 
     openaiApiKey: env.OPENAI_API_KEY ?? '',
-    model: env.AGENT_MODEL || 'gpt-5.4-nano',
+    // Passed all 30 evaluation tasks at under half gpt-5.4-nano's price.
+    model: env.AGENT_MODEL || 'gpt-4.1-nano',
     reasoningEffort: oneOf(
       env.AGENT_REASONING_EFFORT,
       ['none', 'minimal', 'low', 'medium', 'high'] as const,
-      // gpt-5.4-mini on Chat Completions accepts tools only without reasoning.
+      // Ignored for gpt-4.1-*; gpt-5.4-* accept tools only without reasoning.
       'none',
     ),
     maxOutputTokens: int(env.AGENT_MAX_OUTPUT_TOKENS, 1200),
@@ -111,8 +124,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     confirmMode: oneOf(env.AGENT_CONFIRM_MODE, ['agent', 'user'] as const, 'agent'),
 
     maxMessageChars: int(env.AGENT_MAX_MESSAGE_CHARS, 2000),
-    conversationTtlMs: int(env.AGENT_CONVERSATION_TTL_MINUTES, 240) * 60_000,
+    conversationTtlMs: 30 * 60_000,
     maxConversationsPerUser: int(env.AGENT_MAX_CONVERSATIONS_PER_USER, 5),
+    historyMaxTurns: Math.max(1, int(env.AGENT_HISTORY_MAX_TURNS, 10)),
     historyBudgetChars: int(env.AGENT_HISTORY_BUDGET_CHARS, 24_000),
     toolResultMaxChars: int(env.AGENT_TOOL_RESULT_MAX_CHARS, 6_000),
     rateLimit: int(env.AGENT_RATE_LIMIT, 30),

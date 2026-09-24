@@ -3,6 +3,7 @@ import type { AgentClaims } from './claims.js';
 import type { Config } from './config.js';
 import {
   historyForModel,
+  trimHistory,
   type Conversation,
   type TranscriptEntry,
 } from './conversations.js';
@@ -13,6 +14,7 @@ import {
   ModelError,
   type ChatModel,
   type Message,
+  type ModelChoice,
   type ModelTool,
   type TokenUsage,
 } from './llm.js';
@@ -45,6 +47,7 @@ export type AgentEvent =
 
 export type ErrorCode =
   | 'SESSION_EXPIRED'
+  | 'SESSION_ENDED'
   | 'CREDITS_EXHAUSTED'
   | 'FORBIDDEN'
   | 'MODEL_UNAVAILABLE'
@@ -69,6 +72,9 @@ export interface ActionResult {
  */
 const HOST_ONLY_TOOLS = new Set(['confirm_action', 'cancel_action']);
 
+/** Entries of the visible exchange kept for the app to reload. */
+const MAX_TRANSCRIPT = 200;
+
 export class AgentFailure extends Error {
   constructor(
     readonly code: ErrorCode,
@@ -81,6 +87,12 @@ export class AgentFailure extends Error {
 export function toFailure(err: unknown): AgentFailure {
   if (err instanceof AgentFailure) return err;
   if (err instanceof ToolServerError || err instanceof BackendError) {
+    if (err.status === 401 && err instanceof BackendError && err.code === 'AGENT_SESSION_ENDED') {
+      return new AgentFailure(
+        'SESSION_ENDED',
+        'This conversation has ended. Your next message starts a new one.',
+      );
+    }
     if (err.status === 401) {
       return new AgentFailure('SESSION_EXPIRED', 'The assistant session has expired.');
     }
@@ -180,6 +192,7 @@ export class Agent {
     if (await this.answerPendingDraft(input)) return;
 
     let usage = emptyUsage();
+    let usedModel = this.model.name;
     const entry: TranscriptEntry = { role: 'assistant', text: '', at: '' };
     try {
       const quota = await input.backend.quota();
@@ -189,6 +202,11 @@ export class Agent {
           `This school has used all ${quota.limit} AI Assistant credits for ${quota.month}. An administrator can add more.`,
         );
       }
+      // The hub's model choice, when it made one; otherwise AGENT_MODEL.
+      const model: ModelChoice | undefined = quota.model
+        ? { name: quota.model, reasoningEffort: quota.reasoningEffort }
+        : undefined;
+      usedModel = model?.name ?? usedModel;
       const { tools, instructions } = await input.tools.catalog();
       const byName = new Map(tools.map((t) => [t.name, t]));
       const modelTools = toModelTools(tools);
@@ -201,7 +219,12 @@ export class Agent {
           role: 'system',
           content: contextMessage(input.claims, input.mode, instructions),
         },
-        ...historyForModel(conv.history, this.config.historyBudgetChars),
+        ...historyForModel(
+          conv.history,
+          this.config.historyBudgetChars,
+          // The current message is a turn too.
+          this.config.historyMaxTurns + 1,
+        ),
       ];
 
       const drafts: DraftInfo[] = [];
@@ -220,6 +243,7 @@ export class Agent {
               messages,
               tools: modelTools,
               cacheKey: `sms-agent:${input.claims.schoolId}:${input.claims.role}`,
+              model,
               signal: input.signal,
             },
             (delta) => {
@@ -237,6 +261,7 @@ export class Agent {
           throw err;
         }
         usage = addUsage(usage, reply.usage);
+        usedModel = reply.model ?? usedModel;
 
         const assistant: Message = reply.toolCalls.length
           ? {
@@ -320,19 +345,23 @@ export class Agent {
       entry.text = f.message;
     } finally {
       sealHistory(conv.history);
+      trimHistory(conv.history, this.config.historyMaxTurns + 1);
       entry.at = new Date().toISOString();
       if (entry.text) conv.transcript.push(entry);
-      await this.reportUsage(input, usage);
+      if (conv.transcript.length > MAX_TRANSCRIPT) {
+        conv.transcript.splice(0, conv.transcript.length - MAX_TRANSCRIPT);
+      }
+      await this.reportUsage(input, usage, usedModel);
     }
   }
 
   /** Charges the school for the model tokens this turn used. */
-  private async reportUsage(input: TurnInput, usage: TokenUsage) {
+  private async reportUsage(input: TurnInput, usage: TokenUsage, model: string) {
     if (!usage.input && !usage.cached && !usage.output) return;
     try {
       const r = await input.backend.reportUsage({
         kind: 'LLM',
-        model: this.model.name,
+        model,
         inputTokens: usage.input,
         cachedInputTokens: usage.cached,
         outputTokens: usage.output,

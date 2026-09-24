@@ -18,6 +18,11 @@ export interface Quota {
   remaining: number;
   /** sms-backend's AGENT_CONFIRM_REQUIRES_USER_TOKEN: only the app may confirm. */
   confirmRequiresUserToken?: boolean;
+  /** Chat model chosen in the hub; null: use AGENT_MODEL. */
+  model?: string | null;
+  reasoningEffort?: 'none' | 'minimal' | null;
+  /** Idle minutes after which the assistant session (conversation) is over. */
+  sessionIdleMinutes?: number;
 }
 
 export interface HostUsage {
@@ -58,6 +63,11 @@ export class SmsBackend {
 
   quota() {
     return this.request<Quota>('GET', '/agent/quota');
+  }
+
+  /** Ends this token's assistant session (new chat); its tokens stop working. */
+  endSession() {
+    return this.request<{ ended: boolean }>('POST', '/agent/session/end');
   }
 
   reportUsage(usage: HostUsage) {

@@ -30,6 +30,7 @@ export interface AppDeps {
 
 const STATUS: Record<ErrorCode, number> = {
   SESSION_EXPIRED: 401,
+  SESSION_ENDED: 401,
   CREDITS_EXHAUSTED: 402,
   FORBIDDEN: 403,
   MODEL_UNAVAILABLE: 503,
@@ -99,7 +100,9 @@ export function createApp(deps: AppDeps) {
   const agent = new Agent(config, deps.model);
   const voice = deps.voice ?? new Voice(config);
   const conversations = new ConversationStore(
-    config.conversationTtlMs,
+    // A little past the backend's idle limit: sms-backend decides when a
+    // session is over; this only frees memory afterwards.
+    () => config.conversationTtlMs + 5 * 60_000,
     config.maxConversationsPerUser,
   );
   const catalogs = new CatalogCache();
@@ -125,10 +128,16 @@ export function createApp(deps: AppDeps) {
     verified.set(key, claims.exp ? claims.exp * 1000 : Date.now() + 5 * 60_000);
   };
 
-  /** sms-backend decides who confirms; AGENT_CONFIRM_MODE is only the fallback. */
-  const syncConfirmMode = (q: Quota) => {
+  /**
+   * sms-backend decides who confirms and how long a conversation may idle;
+   * AGENT_CONFIRM_MODE and the built-in 30 minutes are only fallbacks.
+   */
+  const syncFromBackend = (q: Quota) => {
     if (typeof q.confirmRequiresUserToken === 'boolean') {
       config.confirmMode = q.confirmRequiresUserToken ? 'user' : 'agent';
+    }
+    if (typeof q.sessionIdleMinutes === 'number' && q.sessionIdleMinutes > 0) {
+      config.conversationTtlMs = q.sessionIdleMinutes * 60_000;
     }
   };
 
@@ -183,7 +192,7 @@ export function createApp(deps: AppDeps) {
     if (!isVerified(key)) {
       try {
         const quota = await session.backend.quota();
-        syncConfirmMode(quota);
+        syncFromBackend(quota);
         markVerified(key, claims);
         res.locals.quota = quota;
       } catch (err) {
@@ -211,12 +220,14 @@ export function createApp(deps: AppDeps) {
     let quota = res.locals.quota as Quota | undefined;
     try {
       quota ??= await sessionOf(res).backend.quota();
-      syncConfirmMode(quota);
+      syncFromBackend(quota);
     } catch (err) {
       return failWith(res, err);
     }
     res.json({
-      model: config.model,
+      model: quota.model || config.model,
+      conversationId: sessionOf(res).claims.agentSessionId,
+      idleMinutes: Math.round(config.conversationTtlMs / 60_000),
       credits: { remaining: quota.remaining, limit: quota.limit, month: quota.month },
       confirmMode: config.confirmMode,
       voice: { transcribe: voice.canTranscribe, speak: voice.canSpeak },
@@ -243,8 +254,11 @@ export function createApp(deps: AppDeps) {
       );
     }
     if (limited(res, s.owner)) return;
+    // One conversation per assistant session; conversationId in the body is
+    // accepted for older apps but the session decides.
+    const sessionId = s.claims.agentSessionId;
     const conv =
-      conversations.get(s.owner, parsed.data.conversationId) ?? conversations.create(s.owner);
+      conversations.get(s.owner, sessionId) ?? conversations.create(s.owner, sessionId);
     if (conv.busy) {
       return fail(res, 409, 'BUSY', 'Still answering your previous message.');
     }
@@ -300,6 +314,8 @@ export function createApp(deps: AppDeps) {
     res.json({ id: conv.id, transcript: conv.transcript, pending: conv.pending });
   });
 
+  // New chat: discards pending drafts and ends the assistant session, so
+  // this token stops working and the app starts a fresh session.
   v1.delete('/conversations/:id', async (req, res) => {
     const s = sessionOf(res);
     const conv = conversations.get(s.owner, req.params.id);
@@ -307,6 +323,10 @@ export function createApp(deps: AppDeps) {
       const ids = conv.pending.flatMap((d) => d.action_ids);
       await Promise.all(ids.map((id) => s.backend.cancelAction(id).catch(() => undefined)));
       conversations.delete(s.owner, conv.id);
+    }
+    if (req.params.id === s.claims.agentSessionId) {
+      await s.backend.endSession().catch(() => undefined);
+      verified.delete(createHash('sha256').update(s.token).digest('hex'));
     }
     res.status(204).end();
   });
