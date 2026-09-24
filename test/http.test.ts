@@ -309,22 +309,33 @@ describe('drafts and confirmation', () => {
 });
 
 describe('voice', () => {
-  it('reports voice unavailable so the app can use the device voice', async () => {
-    const base = await app({ model: new FakeModel([]) });
-    const caps = await fetch(`${base}/v1/capabilities`, {
+  const caps = (base: string) =>
+    fetch(`${base}/v1/capabilities`, {
       headers: { Authorization: `Bearer ${token()}` },
     }).then((r) => r.json() as Promise<any>);
-    expect(caps.voice).toEqual({ transcribe: false, speak: false });
-    expect(caps.credits).toEqual({ remaining: 400, limit: 500, month: '2026-09' });
+
+  it("uses the device's own speech when the school chose it (the default)", async () => {
+    const base = await app({ model: new FakeModel([]) });
+    const c = await caps(base);
+    expect(c.voice).toEqual({ input: 'device', output: 'device', transcribe: false, speak: false });
+    expect(c.credits).toEqual({ remaining: 400, limit: 500, month: '2026-09' });
     const r = await post(base, '/v1/voice/speak', { text: 'hello' });
     expect(r.status).toBe(503);
     expect(r.json.code).toBe('VOICE_UNAVAILABLE');
   });
 
-  it('transcribes and charges by audio length', async () => {
-    const voice = new Voice(testConfig({ sttModel: 'stt', ttsModel: 'tts' }));
-    vi.spyOn(voice, 'transcribe').mockResolvedValue({ text: 'mark six b', seconds: 7 });
+  it('reports voice switched off', async () => {
+    state.settings = { voiceInput: 'off', voiceOutput: 'off' };
+    const base = await app({ model: new FakeModel([]) });
+    expect((await caps(base)).voice).toMatchObject({ input: 'off', output: 'off' });
+  });
+
+  it("transcribes with the school's model and charges by audio length", async () => {
+    state.settings = { voiceInput: 'gpt-4o-transcribe' };
+    const voice = new Voice(testConfig());
+    const spy = vi.spyOn(voice, 'transcribe').mockResolvedValue({ text: 'mark six b', seconds: 7 });
     const base = await app({ model: new FakeModel([]), voice });
+    expect((await caps(base)).voice).toMatchObject({ input: 'server', transcribe: true });
     const res = await fetch(`${base}/v1/voice/transcribe`, {
       method: 'POST',
       headers: {
@@ -335,14 +346,31 @@ describe('voice', () => {
       body: Buffer.alloc(4000, 1),
     });
     expect(await res.json()).toEqual({ text: 'mark six b' });
+    expect(spy.mock.calls[0]![0]).toBe('gpt-4o-transcribe');
     expect(state.calls.find((c) => c.path === '/agent/usage/report')!.body).toMatchObject({
       kind: 'STT',
+      model: 'gpt-4o-transcribe',
       audioSeconds: 7,
     });
   });
 
+  it("speaks with the school's model and voice", async () => {
+    state.settings = { voiceOutput: 'tts-1', ttsVoice: 'nova' };
+    const voice = new Voice(testConfig());
+    const spy = vi.spyOn(voice, 'speak').mockResolvedValue(Buffer.from('mp3'));
+    const base = await app({ model: new FakeModel([]), voice });
+    const r = await fetch(`${base}/v1/voice/speak`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token()}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: 'Done.' }),
+    });
+    expect(r.status).toBe(200);
+    expect(spy.mock.calls[0]!.slice(0, 2)).toEqual(['tts-1', 'nova']);
+  });
+
   it('falls back when the provider refuses the voice model', async () => {
-    const voice = new Voice(testConfig({ sttModel: 'stt', ttsModel: 'tts' }));
+    state.settings = { voiceOutput: 'gpt-4o-mini-tts' };
+    const voice = new Voice(testConfig());
     vi.spyOn(voice, 'speak').mockRejectedValue(new VoiceUnavailable());
     const base = await app({ model: new FakeModel([]), voice });
     const r = await post(base, '/v1/voice/speak', { text: 'Done.' });
@@ -405,9 +433,10 @@ describe('sessions and model choice', () => {
     expect(model.requests).toHaveLength(1);
   });
 
-  it('sends the model at most AGENT_HISTORY_MAX_TURNS earlier exchanges', async () => {
+  it("sends the model at most the school's history turns", async () => {
+    state.settings = { historyMaxTurns: 2 };
     const model = new FakeModel([]);
-    const base = await app({ model, config: testConfig({ historyMaxTurns: 2 }) });
+    const base = await app({ model });
     for (const q of ['q1', 'q2', 'q3', 'q4']) await chat(base, { message: q });
     const sent = model.requests.at(-1)!.messages.filter((m) => m.role === 'user').map((m) => m.content);
     expect(sent).toEqual(['q2', 'q3', 'q4']);

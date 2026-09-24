@@ -193,6 +193,7 @@ export class Agent {
 
     let usage = emptyUsage();
     let usedModel = this.model.name;
+    let historyTurns = this.config.historyMaxTurns;
     const entry: TranscriptEntry = { role: 'assistant', text: '', at: '' };
     try {
       const quota = await input.backend.quota();
@@ -207,6 +208,7 @@ export class Agent {
         ? { name: quota.model, reasoningEffort: quota.reasoningEffort }
         : undefined;
       usedModel = model?.name ?? usedModel;
+      historyTurns = quota.historyMaxTurns ?? historyTurns;
       const { tools, instructions } = await input.tools.catalog();
       const byName = new Map(tools.map((t) => [t.name, t]));
       const modelTools = toModelTools(tools);
@@ -223,7 +225,7 @@ export class Agent {
           conv.history,
           this.config.historyBudgetChars,
           // The current message is a turn too.
-          this.config.historyMaxTurns + 1,
+          (quota.historyMaxTurns ?? this.config.historyMaxTurns) + 1,
         ),
       ];
 
@@ -345,7 +347,7 @@ export class Agent {
       entry.text = f.message;
     } finally {
       sealHistory(conv.history);
-      trimHistory(conv.history, this.config.historyMaxTurns + 1);
+      trimHistory(conv.history, historyTurns + 1);
       entry.at = new Date().toISOString();
       if (entry.text) conv.transcript.push(entry);
       if (conv.transcript.length > MAX_TRANSCRIPT) {

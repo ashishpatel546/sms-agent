@@ -23,6 +23,13 @@ export interface Quota {
   reasoningEffort?: 'none' | 'minimal' | null;
   /** Idle minutes after which the assistant session (conversation) is over. */
   sessionIdleMinutes?: number;
+  /** Earlier exchanges the model sees with each message. */
+  historyMaxTurns?: number;
+  /** 'off' | 'device' | a speech-to-text model (hub setting). */
+  voiceInput?: string;
+  /** 'off' | 'device' | a text-to-speech model (hub setting). */
+  voiceOutput?: string;
+  ttsVoice?: string;
 }
 
 export interface HostUsage {

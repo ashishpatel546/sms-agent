@@ -36,7 +36,7 @@ export function token(c: Partial<AgentClaims> | Record<string, unknown> = claims
 
 export function testConfig(over: Partial<Config> = {}): Config {
   return {
-    ...loadConfig({ SMS_API_URL: BACKEND, OPENAI_API_KEY: 'test', AGENT_STT_MODEL: '', AGENT_TTS_MODEL: '' }),
+    ...loadConfig({ SMS_API_URL: BACKEND, OPENAI_API_KEY: 'test' }),
     ...over,
   };
 }
@@ -159,6 +159,8 @@ export interface BackendState {
   model?: string | null;
   /** true: the assistant session ended (new chat or idle). */
   sessionEnded?: boolean;
+  /** The school's other hub settings, as /agent/quota reports them. */
+  settings?: Record<string, unknown>;
 }
 
 /** Routes fetch() to a fake sms-backend. */
@@ -181,6 +183,7 @@ export function fakeBackend(state: BackendState) {
       model: state.model ?? null,
       reasoningEffort: null,
       sessionIdleMinutes: 30,
+      ...state.settings,
     };
     if (state.tokenValid === false) return json({ message: 'Unauthorized' }, 401);
     if (state.sessionEnded) {

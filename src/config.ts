@@ -1,4 +1,14 @@
-/** Runtime configuration, read once from the environment. */
+/**
+ * Runtime configuration.
+ *
+ * The environment only says where things are and holds the secrets (see
+ * .env.example). How the assistant behaves — chat model, voice, idle time,
+ * history — is set in the hub per school and arrives from sms-backend with
+ * `GET /agent/quota` before every reply; the values here are only what is
+ * used if the backend does not send one. The limits below can still be
+ * overridden by an environment variable of the same name in an emergency,
+ * but none is needed.
+ */
 export interface Config {
   host: string;
   port: number;
@@ -13,53 +23,45 @@ export interface Config {
    * expression. The portal is served per school on a subdomain.
    */
   corsOriginRegex: RegExp;
-
   openaiApiKey: string;
-  /**
-   * Chat model with tool calling — the default. A model chosen in the hub
-   * (sms-backend's agent settings) takes precedence, message by message.
-   */
+
+  // ── Fallbacks for the hub settings ─────────────────────────────────────
+  /** Chat model with tool calling. */
   model: string;
   /**
-   * Which values work depends on the model: gpt-5.4-* accept tools only with
-   * `none`; gpt-5 / gpt-5-mini / gpt-5-nano need `minimal` or higher.
+   * Used only for a reasoning model (gpt-5*, o*): gpt-5.4-* accept tools only
+   * with `none`; gpt-5 / gpt-5-mini / gpt-5-nano need `minimal` or higher.
    */
   reasoningEffort: 'none' | 'minimal' | 'low' | 'medium' | 'high';
-  maxOutputTokens: number;
-  /** Model/tool rounds per user message before the assistant gives up. */
-  maxToolRounds: number;
-  /** Empty disables server-side voice; the browser's own speech is used. */
-  sttModel: string;
-  ttsModel: string;
+  /** 'off' | 'device' | a speech-to-text model. */
+  voiceInput: string;
+  /** 'off' | 'device' | a text-to-speech model. */
+  voiceOutput: string;
   ttsVoice: string;
-  maxAudioSeconds: number;
-  maxAudioBytes: number;
-  maxSpeakChars: number;
-
+  /** Earlier exchanges (question + answer) the model sees with a message. */
+  historyMaxTurns: number;
+  /** Conversation idle time; synced from the school's session idle limit. */
+  conversationTtlMs: number;
   /**
-   * Who confirms drafted changes, and must match sms-backend's
+   * Who confirms drafted changes; synced from sms-backend's
    * AGENT_CONFIRM_REQUIRES_USER_TOKEN:
    *   agent — this service confirms after the user presses Confirm or
-   *           clearly says yes (default);
+   *           clearly says yes;
    *   user  — the app confirms with the user's own session token, then
    *           asks this service to run the confirmed change.
    */
   confirmMode: 'agent' | 'user';
 
+  // ── Limits ─────────────────────────────────────────────────────────────
+  maxOutputTokens: number;
+  /** Model/tool rounds per user message before the assistant gives up. */
+  maxToolRounds: number;
+  maxAudioSeconds: number;
+  maxAudioBytes: number;
+  maxSpeakChars: number;
   maxMessageChars: number;
-  /**
-   * Idle time after which a conversation is over. sms-backend's
-   * AGENT_SESSION_IDLE_MINUTES decides it (synced from /agent/quota); this
-   * is only the value used until then.
-   */
-  conversationTtlMs: number;
   /** Conversations kept per user; the oldest is dropped beyond this. */
   maxConversationsPerUser: number;
-  /**
-   * Earlier exchanges (a question and its answer, with any tool calls) the
-   * model sees with each new message. Older ones are dropped.
-   */
-  historyMaxTurns: number;
   /** Characters of history sent to the model — a cap on top of the turns. */
   historyBudgetChars: number;
   /** Characters of one tool result kept for the model. */
@@ -70,22 +72,9 @@ export interface Config {
   requestTimeoutMs: number;
 }
 
-function bool(v: string | undefined, fallback: boolean): boolean {
-  if (v === undefined || v === '') return fallback;
-  return ['1', 'true', 'yes', 'on'].includes(v.toLowerCase());
-}
-
 function int(v: string | undefined, fallback: number): number {
   const n = v ? Number.parseInt(v, 10) : Number.NaN;
   return Number.isFinite(n) ? n : fallback;
-}
-
-function oneOf<T extends string>(
-  v: string | undefined,
-  allowed: readonly T[],
-  fallback: T,
-): T {
-  return allowed.includes(v as T) ? (v as T) : fallback;
 }
 
 /** Local dev portal (<slug>.localhost:4000), the Cloudflare tunnel and production. */
@@ -94,7 +83,6 @@ const DEFAULT_ORIGINS =
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const trim = (u: string) => u.replace(/\/+$/, '');
-  const voice = bool(env.AGENT_VOICE_ENABLED, true);
   return {
     host: env.AGENT_HOST ?? '127.0.0.1',
     port: int(env.AGENT_PORT, 4030),
@@ -102,31 +90,24 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     mcpUrl: env.SMS_MCP_URL ?? 'http://127.0.0.1:4020/mcp',
     mcpKey: env.SMS_MCP_KEY ?? '',
     corsOriginRegex: new RegExp(env.AGENT_CORS_ORIGIN_REGEX || DEFAULT_ORIGINS),
-
     openaiApiKey: env.OPENAI_API_KEY ?? '',
-    // Passed all 30 evaluation tasks at under half gpt-5.4-nano's price.
-    model: env.AGENT_MODEL || 'gpt-4.1-nano',
-    reasoningEffort: oneOf(
-      env.AGENT_REASONING_EFFORT,
-      ['none', 'minimal', 'low', 'medium', 'high'] as const,
-      // Ignored for gpt-4.1-*; gpt-5.4-* accept tools only without reasoning.
-      'none',
-    ),
+
+    model: 'gpt-4.1-nano',
+    reasoningEffort: 'none',
+    voiceInput: 'device',
+    voiceOutput: 'device',
+    ttsVoice: 'coral',
+    historyMaxTurns: 10,
+    conversationTtlMs: 15 * 60_000,
+    confirmMode: 'agent',
+
     maxOutputTokens: int(env.AGENT_MAX_OUTPUT_TOKENS, 1200),
     maxToolRounds: int(env.AGENT_MAX_TOOL_ROUNDS, 6),
-    sttModel: voice ? (env.AGENT_STT_MODEL ?? 'gpt-4o-mini-transcribe') : '',
-    ttsModel: voice ? (env.AGENT_TTS_MODEL ?? 'gpt-4o-mini-tts') : '',
-    ttsVoice: env.AGENT_TTS_VOICE || 'coral',
     maxAudioSeconds: int(env.AGENT_MAX_AUDIO_SECONDS, 60),
     maxAudioBytes: int(env.AGENT_MAX_AUDIO_BYTES, 5 * 1024 * 1024),
     maxSpeakChars: int(env.AGENT_MAX_SPEAK_CHARS, 600),
-
-    confirmMode: oneOf(env.AGENT_CONFIRM_MODE, ['agent', 'user'] as const, 'agent'),
-
     maxMessageChars: int(env.AGENT_MAX_MESSAGE_CHARS, 2000),
-    conversationTtlMs: 30 * 60_000,
     maxConversationsPerUser: int(env.AGENT_MAX_CONVERSATIONS_PER_USER, 5),
-    historyMaxTurns: Math.max(1, int(env.AGENT_HISTORY_MAX_TURNS, 10)),
     historyBudgetChars: int(env.AGENT_HISTORY_BUDGET_CHARS, 24_000),
     toolResultMaxChars: int(env.AGENT_TOOL_RESULT_MAX_CHARS, 6_000),
     rateLimit: int(env.AGENT_RATE_LIMIT, 30),

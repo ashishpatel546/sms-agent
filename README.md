@@ -22,7 +22,7 @@ The service keeps no secrets except the model provider key, and has no database.
 3. **Model loop.** The model sees:
    - the tools from sms-mcp, except `confirm_action`;
    - a short fixed system prompt, then a context note with the user, the time in IST and the reply mode;
-   - the conversation history: the last `AGENT_HISTORY_MAX_TURNS` exchanges (default 10), whole turns only, within `AGENT_HISTORY_BUDGET_CHARS`.
+   - the conversation history: the last few exchanges (the school's *history turns* hub setting, default 10), whole turns only, within `AGENT_HISTORY_BUDGET_CHARS`.
 
    It calls tools, possibly several in parallel, for up to `AGENT_MAX_TOOL_ROUNDS` rounds. Text streams to the app as it is written.
 4. **Drafts.** A `draft_*` result carries `structuredContent.draft`. The app shows it as a card with **Confirm and save** and **Cancel**. A new draft replaces the previous one, which is cancelled in sms-backend.
@@ -50,9 +50,11 @@ Error bodies are `{ code, message }`. `message` is written to be shown to the pe
 
 | Use | Default | Setting |
 |---|---|---|
-| Chat with tools | `gpt-4.1-nano` | Hub: AI > Assistant > Chat model. Fallback: `AGENT_MODEL` |
-| Speech to text | `gpt-4o-mini-transcribe` | `AGENT_STT_MODEL` |
-| Text to speech | `gpt-4o-mini-tts` | `AGENT_TTS_MODEL`, `AGENT_TTS_VOICE` |
+| Chat with tools | `gpt-4.1-nano` | Hub: chat model |
+| Voice input | the device's own recognition (free) | Hub: voice input — off, device, `gpt-4o-mini-transcribe` ($0.003/min) or `gpt-4o-transcribe` ($0.006/min) |
+| Voice output | the device's own voice (free) | Hub: voice output — off, device, `gpt-4o-mini-tts` (~$0.015/min) or `tts-1` ($15/1M chars), plus the voice |
+
+**Settings live in the hub, not here.** Chat model, voice input, voice output, voice, session idle minutes and history turns are platform defaults with optional per-school overrides (hub: AI > Assistant, and each school's page). sms-backend returns a school's settings with `GET /agent/quota`, which this service calls before every reply, so changes apply from the next message. `.env` holds only addresses and secrets (see `.env.example`). Limits such as `AGENT_RATE_LIMIT` or `AGENT_MAX_AUDIO_SECONDS` have built-in values in `src/config.ts` and can be overridden by an environment variable of the same name if ever needed.
 
 **Choosing the chat model.** On 24 Sep 2026 each model ran the same 15 staff tasks twice, against the local school. The tasks covered:
 - the day's briefing, class absentees and low attendance;
@@ -73,14 +75,16 @@ A task passed when the right tool was called, the draft was correct, or the refu
 | gpt-5-mini (minimal) | 28/30 | 4.8 s | $0.65 |
 | gpt-5-nano (minimal) | 25/30: asks needless questions instead of calling tools | 2.9 s | $0.11 |
 
-**Changing the model.** A platform admin picks the model in the hub (AI > Assistant). sms-backend stores it in `agent_settings` and returns it with `GET /agent/quota`, which this service calls before every reply, so the change applies from the next message — no restart. The hub offers only the evaluated models above, each with the reasoning setting it needs. If the provider key refuses the chosen model, the reply falls back to `AGENT_MODEL` and the log says so.
+**Changing the model.** The hub offers only the evaluated chat models above, each with the reasoning setting it needs. If the provider key refuses the chosen model, the reply falls back to `gpt-4.1-nano` and the log says so.
 
-Costs use the prices in school-ai's `llm_model_pricing`, with prompt-cache hits billed at the cached rate. `gpt-5.4-*` models only accept tools with `reasoning_effort: none`; `gpt-5`, `gpt-5-mini` and `gpt-5-nano` need `minimal` or higher (`AGENT_REASONING_EFFORT`); `gpt-4.1-*` takes no reasoning setting, and none is sent. If the provider key cannot use a speech model, the service marks voice unavailable for 10 minutes. The app then switches to the browser's own speech recognition and synthesis; nothing breaks.
+Costs use the prices in school-ai's `llm_model_pricing`, with prompt-cache hits billed at the cached rate. `gpt-5.4-*` models only accept tools with `reasoning_effort: none`; `gpt-5`, `gpt-5-mini` and `gpt-5-nano` need `minimal` or higher (set automatically); `gpt-4.1-*` takes no reasoning setting, and none is sent. No chat model can listen or speak, so voice is chosen separately. If the provider key cannot use a speech model, the service marks that model unavailable for 10 minutes. The app then switches to the browser's own speech recognition and synthesis; nothing breaks.
 
 ## Confirm modes
 
-- `AGENT_CONFIRM_MODE=agent` (default): this service confirms after the Confirm button or a plain yes.
-- `AGENT_CONFIRM_MODE=user`: stricter. It must be paired with `AGENT_CONFIRM_REQUIRES_USER_TOKEN=true` in sms-backend. The app confirms each draft with the person's own session (`POST {API_URL}/agent/actions/:id/confirm`) and passes the returned request to `/v1/actions/execute`. A spoken "yes" then only reminds the person to press Confirm.
+Set by sms-backend's `AGENT_CONFIRM_REQUIRES_USER_TOKEN`, which this service reads with the quota.
+
+- `agent` (default): this service confirms after the Confirm button or a plain yes.
+- `user` (`AGENT_CONFIRM_REQUIRES_USER_TOKEN=true`): stricter. The app confirms each draft with the person's own session (`POST {API_URL}/agent/actions/:id/confirm`) and passes the returned request to `/v1/actions/execute`. A spoken "yes" then only reminds the person to press Confirm.
 
 ## Running
 
@@ -98,7 +102,7 @@ Local stack: sms-backend on 4010, sms-mcp on 4020, sms-agent on 4030. Start the 
 
 ## Operating notes
 
-- **Conversations** follow sms-backend's assistant sessions: the conversation id is the token's `agentSessionId`. A session ends on New chat or after `AGENT_SESSION_IDLE_MINUTES` (sms-backend, default 30) without activity; sms-backend then refuses its tokens, and the app's next token opens a fresh session, so a returning user starts a fresh conversation. While a session is live, the app's token refresh continues it (`POST /agent/session { resume }`).
+- **Conversations** follow sms-backend's assistant sessions: the conversation id is the token's `agentSessionId`. A session ends on New chat or after the school's session idle minutes (hub setting, default 15) without activity; sms-backend then refuses its tokens, and the app's next token opens a fresh session, so a returning user starts a fresh conversation. While a session is live, the app's token refresh continues it (`POST /agent/session { resume }`).
 - **Conversations** live in memory, at most 5 per person. They are not records. School data and drafts live in sms-backend, and losing a conversation only means starting a new one. With several instances, route each user to the same instance, or move `ConversationStore` to Redis.
 - **sms-mcp link:** set the same random value as `SMS_MCP_KEY` here and `MCP_SHARED_SECRET` in sms-mcp. Only this service is meant to reach sms-mcp, and sms-mcp should never be published publicly.
 - **Local tunnel:** `agent-api.appme.in` routes to `127.0.0.1:4030`, so the portal on `<slug>.appme.in` works from a phone. `helping-scripts/start.sh` and `stop.sh` manage it as the `agent` service, and sms-mcp as `mcp`.

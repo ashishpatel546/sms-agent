@@ -9,7 +9,7 @@ import { ConversationStore, type Conversation } from './conversations.js';
 import type { ChatModel } from './llm.js';
 import { CatalogCache, McpTools, type ToolSource } from './mcp.js';
 import { RateLimiter } from './ratelimit.js';
-import { Voice, VoiceUnavailable } from './voice.js';
+import { Voice, VoiceUnavailable, voiceMode } from './voice.js';
 
 export const SERVICE = { name: 'sms-agent', version: '0.1.0' };
 
@@ -224,13 +224,23 @@ export function createApp(deps: AppDeps) {
     } catch (err) {
       return failWith(res, err);
     }
+    const input = voiceMode(quota.voiceInput ?? config.voiceInput);
+    const output = voiceMode(quota.voiceOutput ?? config.voiceOutput);
     res.json({
       model: quota.model || config.model,
       conversationId: sessionOf(res).claims.agentSessionId,
       idleMinutes: Math.round(config.conversationTtlMs / 60_000),
       credits: { remaining: quota.remaining, limit: quota.limit, month: quota.month },
       confirmMode: config.confirmMode,
-      voice: { transcribe: voice.canTranscribe, speak: voice.canSpeak },
+      // input/output: what the school chose in the hub. transcribe/speak:
+      // whether server speech works right now (the app falls back to the
+      // device's own speech when it does not).
+      voice: {
+        input,
+        output,
+        transcribe: input === 'server' && voice.available(quota.voiceInput),
+        speak: output === 'server' && voice.available(quota.voiceOutput),
+      },
       limits: {
         maxMessageChars: config.maxMessageChars,
         maxAudioSeconds: config.maxAudioSeconds,
@@ -410,11 +420,14 @@ export function createApp(deps: AppDeps) {
     await runAction(res, conv, () => agent.cancel(conv, body.data.actionIds, s.backend));
   });
 
-  /** Refuses (and answers) when the school has no credits left. */
-  const hasCredits = async (res: Response, s: Session) => {
+  /**
+   * The school's quota and settings, or null after answering: no credits
+   * left, or the backend refused.
+   */
+  const withCredits = async (res: Response, s: Session): Promise<Quota | null> => {
     try {
       const q = await s.backend.quota();
-      if (q.remaining > 0) return true;
+      if (q.remaining > 0) return q;
       fail(
         res,
         402,
@@ -424,7 +437,7 @@ export function createApp(deps: AppDeps) {
     } catch (err) {
       failWith(res, err);
     }
-    return false;
+    return null;
   };
 
   const voiceOff = (res: Response) =>
@@ -438,7 +451,6 @@ export function createApp(deps: AppDeps) {
     }),
     async (req, res) => {
       const s = sessionOf(res);
-      if (!voice.canTranscribe) return voiceOff(res);
       const audio = req.body as Buffer;
       if (!Buffer.isBuffer(audio) || audio.length < 1000) {
         return fail(res, 400, 'NO_AUDIO', "I didn't catch anything. Try again.");
@@ -449,19 +461,23 @@ export function createApp(deps: AppDeps) {
         return fail(res, 413, 'AUDIO_TOO_LONG', `Keep voice messages under ${config.maxAudioSeconds} seconds.`);
       }
       if (limited(res, s.owner)) return;
-      if (!(await hasCredits(res, s))) return;
+      const q = await withCredits(res, s);
+      if (!q) return;
+      const model = q.voiceInput ?? config.voiceInput;
+      if (!voice.available(model)) return voiceOff(res);
       const lang = typeof req.query.lang === 'string' && /^[a-z]{2}$/.test(req.query.lang)
         ? req.query.lang
         : undefined;
       try {
         const t = await voice.transcribe(
+          model,
           audio,
           String(req.headers['content-type'] ?? 'audio/webm'),
           seconds,
           lang,
         );
         await s.backend
-          .reportUsage({ kind: 'STT', model: config.sttModel, audioSeconds: t.seconds })
+          .reportUsage({ kind: 'STT', model, audioSeconds: t.seconds })
           .catch((e: Error) => console.error('[sms-agent] STT usage report failed', e.message));
         res.json({ text: t.text });
       } catch (err) {
@@ -473,16 +489,18 @@ export function createApp(deps: AppDeps) {
 
   v1.post('/voice/speak', express.json({ limit: '16kb' }), async (req, res) => {
     const s = sessionOf(res);
-    if (!voice.canSpeak) return voiceOff(res);
     const body = SpeakBody.safeParse(req.body);
     if (!body.success) return fail(res, 400, 'BAD_REQUEST', 'text is required.');
     const text = speakable(body.data.text, config.maxSpeakChars);
     if (!text) return fail(res, 400, 'BAD_REQUEST', 'Nothing to say.');
-    if (!(await hasCredits(res, s))) return;
+    const q = await withCredits(res, s);
+    if (!q) return;
+    const model = q.voiceOutput ?? config.voiceOutput;
+    if (!voice.available(model)) return voiceOff(res);
     try {
-      const audio = await voice.speak(text);
+      const audio = await voice.speak(model, q.ttsVoice ?? config.ttsVoice, text);
       await s.backend
-        .reportUsage({ kind: 'TTS', model: config.ttsModel, characters: text.length })
+        .reportUsage({ kind: 'TTS', model, characters: text.length })
         .catch((e: Error) => console.error('[sms-agent] TTS usage report failed', e.message));
       res.setHeader('Content-Type', 'audio/mpeg');
       res.setHeader('Cache-Control', 'no-store');
