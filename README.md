@@ -78,6 +78,8 @@ Local stack: sms-backend on 4010, sms-mcp on 4020, sms-agent on 4030. Start the 
 ## Operating notes
 
 - **Conversations** live in memory: 4 idle hours, 5 per person. They are not records. School data and drafts live in sms-backend, and losing a conversation only means starting a new one. With several instances, route each user to the same instance, or move `ConversationStore` to Redis.
+- **sms-mcp link:** set the same random value as `SMS_MCP_KEY` here and `MCP_SHARED_SECRET` in sms-mcp. Only this service is meant to reach sms-mcp, and sms-mcp should never be published publicly.
+- **Local tunnel:** `agent-api.appme.in` routes to `127.0.0.1:4030`, so the portal on `<slug>.appme.in` works from a phone. `helping-scripts/start.sh` and `stop.sh` manage it as the `agent` service, and sms-mcp as `mcp`.
 - **CORS** allows `AGENT_CORS_ORIGIN_REGEX`. The default covers `<slug>.localhost`, `*.appme.in` and `*.colegios.in`.
 - **Limits:** 30 messages per person per 5 minutes, 2,000 characters per message, 60-second voice clips.
 - **Cost, measured locally:** a turn with a tool call uses about 2–5 credits of model tokens, falling to about 2 once the prompt is cached, plus 1–3 credits for the tools. A plain yes or no costs only the write itself.

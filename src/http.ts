@@ -105,7 +105,7 @@ export function createApp(deps: AppDeps) {
   const toolsFor =
     deps.tools ??
     ((token: string, claims: AgentClaims) =>
-      new McpTools(config.mcpUrl, token, claims, catalogs));
+      new McpTools(config.mcpUrl, token, claims, catalogs, config.mcpKey));
   const limiter = new RateLimiter(config.rateLimit, config.rateWindowMs);
 
   const app = express();

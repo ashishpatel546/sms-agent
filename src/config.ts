@@ -6,6 +6,8 @@ export interface Config {
   smsApiUrl: string;
   /** sms-mcp Streamable HTTP endpoint, e.g. http://127.0.0.1:4020/mcp. */
   mcpUrl: string;
+  /** Sent as X-MCP-Key; must equal MCP_SHARED_SECRET in sms-mcp. */
+  mcpKey: string;
   /**
    * Browser origins allowed to call this service (CORS), as one regular
    * expression. The portal is served per school on a subdomain.
@@ -82,6 +84,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     port: int(env.AGENT_PORT, 4030),
     smsApiUrl: trim(env.SMS_API_URL ?? 'http://localhost:4010'),
     mcpUrl: env.SMS_MCP_URL ?? 'http://127.0.0.1:4020/mcp',
+    mcpKey: env.SMS_MCP_KEY ?? '',
     corsOriginRegex: new RegExp(env.AGENT_CORS_ORIGIN_REGEX || DEFAULT_ORIGINS),
 
     openaiApiKey: env.OPENAI_API_KEY ?? '',
@@ -89,7 +92,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     reasoningEffort: oneOf(
       env.AGENT_REASONING_EFFORT,
       ['none', 'low', 'medium', 'high'] as const,
-      'low',
+      // gpt-5.4-mini on Chat Completions accepts tools only without reasoning.
+      'none',
     ),
     maxOutputTokens: int(env.AGENT_MAX_OUTPUT_TOKENS, 1200),
     maxToolRounds: int(env.AGENT_MAX_TOOL_ROUNDS, 6),

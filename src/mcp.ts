@@ -107,13 +107,19 @@ export class McpTools implements ToolSource {
     private readonly token: string,
     private readonly claims: AgentClaims,
     private readonly cache: CatalogCache,
+    private readonly key = '',
   ) {}
 
   private async connect(): Promise<Client> {
     if (this.client) return this.client;
     const client = new Client({ name: 'sms-agent', version: '0.1.0' });
     const transport = new StreamableHTTPClientTransport(new URL(this.url), {
-      requestInit: { headers: { Authorization: `Bearer ${this.token}` } },
+      requestInit: {
+        headers: {
+          Authorization: `Bearer ${this.token}`,
+          ...(this.key ? { 'X-MCP-Key': this.key } : {}),
+        },
+      },
     });
     try {
       await client.connect(transport);
