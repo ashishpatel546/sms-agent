@@ -51,8 +51,8 @@ Error bodies are `{ code, message }`. `message` is written to be shown to the pe
 | Use | Default | Setting |
 |---|---|---|
 | Chat with tools | `gpt-4.1-nano` | Hub: chat model |
-| Voice input | the device's own recognition (free) | Hub: voice input — off, device, `gpt-4o-mini-transcribe` ($0.003/min) or `gpt-4o-transcribe` ($0.006/min) |
-| Voice output | the device's own voice (free) | Hub: voice output — off, device, `gpt-4o-mini-tts` (~$0.015/min) or `tts-1` ($15/1M chars), plus the voice |
+| Voice input | the device's own recognition (free), falling back to `gpt-4o-mini-transcribe` ($0.003/min) where the device cannot listen or fails | Hub: device, `gpt-4o-mini-transcribe`, `gpt-4o-transcribe` ($0.006/min) or off |
+| Voice output | the device's own voice (free) | Hub: device (falls back to `gpt-4o-mini-tts` where the device has no voice for the language), `gpt-4o-mini-tts` (~$0.015/min) or off, plus the voice |
 
 **Settings live in the hub, not here.** Chat model, voice input, voice output, voice, session idle minutes and history turns are platform defaults with optional per-school overrides (hub: AI > Assistant, and each school's page). sms-backend returns a school's settings with `GET /agent/quota`, which this service calls before every reply, so changes apply from the next message. `.env` holds only addresses and secrets (see `.env.example`). Limits such as `AGENT_RATE_LIMIT` or `AGENT_MAX_AUDIO_SECONDS` have built-in values in `src/config.ts` and can be overridden by an environment variable of the same name if ever needed.
 

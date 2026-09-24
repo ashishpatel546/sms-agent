@@ -314,7 +314,20 @@ describe('voice', () => {
       headers: { Authorization: `Bearer ${token()}` },
     }).then((r) => r.json() as Promise<any>);
 
-  it("uses the device's own speech when the school chose it (the default)", async () => {
+  it("offers the device's own speech, with the server model for devices that cannot", async () => {
+    state.settings = {
+      voiceInput: 'device',
+      voiceOutput: 'device',
+      voiceInputModel: 'gpt-4o-mini-transcribe',
+      voiceOutputModel: 'gpt-4o-mini-tts',
+    };
+    const base = await app({ model: new FakeModel([]) });
+    const c = await caps(base);
+    expect(c.voice).toEqual({ input: 'device', output: 'device', transcribe: true, speak: true });
+  });
+
+  it('reports no server speech when the school has none', async () => {
+    state.settings = { voiceInput: 'device', voiceOutput: 'device', voiceInputModel: null, voiceOutputModel: null };
     const base = await app({ model: new FakeModel([]) });
     const c = await caps(base);
     expect(c.voice).toEqual({ input: 'device', output: 'device', transcribe: false, speak: false });
@@ -354,8 +367,8 @@ describe('voice', () => {
     });
   });
 
-  it("speaks with the school's model and voice", async () => {
-    state.settings = { voiceOutput: 'tts-1', ttsVoice: 'nova' };
+  it("speaks with the device choice's fallback model and the school's voice", async () => {
+    state.settings = { voiceOutput: 'device', voiceOutputModel: 'gpt-4o-mini-tts', ttsVoice: 'nova' };
     const voice = new Voice(testConfig());
     const spy = vi.spyOn(voice, 'speak').mockResolvedValue(Buffer.from('mp3'));
     const base = await app({ model: new FakeModel([]), voice });
@@ -365,7 +378,7 @@ describe('voice', () => {
       body: JSON.stringify({ text: 'Done.' }),
     });
     expect(r.status).toBe(200);
-    expect(spy.mock.calls[0]!.slice(0, 2)).toEqual(['tts-1', 'nova']);
+    expect(spy.mock.calls[0]!.slice(0, 2)).toEqual(['gpt-4o-mini-tts', 'nova']);
   });
 
   it('falls back when the provider refuses the voice model', async () => {

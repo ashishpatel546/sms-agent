@@ -29,6 +29,19 @@ export type VoiceChoice = string;
 export const isServerVoice = (choice: VoiceChoice | null | undefined): choice is string =>
   !!choice && choice !== 'off' && choice !== 'device';
 
+/**
+ * The provider model to use for server speech: what sms-backend names (a
+ * server choice, or a device choice's fallback for devices that cannot do
+ * it), else the choice itself when it is a model.
+ */
+export function serverModelFor(
+  choice: VoiceChoice | null | undefined,
+  named: string | null | undefined,
+): string | null {
+  if (named !== undefined) return named;
+  return isServerVoice(choice) ? choice : null;
+}
+
 /** What the app should offer: no voice, the device's own, or ours. */
 export function voiceMode(choice: VoiceChoice | null | undefined): 'off' | 'device' | 'server' {
   if (choice === 'off') return 'off';

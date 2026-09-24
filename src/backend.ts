@@ -30,6 +30,9 @@ export interface Quota {
   /** 'off' | 'device' | a text-to-speech model (hub setting). */
   voiceOutput?: string;
   ttsVoice?: string;
+  /** Provider model for server speech (a device choice's fallback too); null = none. */
+  voiceInputModel?: string | null;
+  voiceOutputModel?: string | null;
 }
 
 export interface HostUsage {

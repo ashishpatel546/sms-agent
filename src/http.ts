@@ -9,7 +9,7 @@ import { ConversationStore, type Conversation } from './conversations.js';
 import type { ChatModel } from './llm.js';
 import { CatalogCache, McpTools, type ToolSource } from './mcp.js';
 import { RateLimiter } from './ratelimit.js';
-import { Voice, VoiceUnavailable, voiceMode } from './voice.js';
+import { serverModelFor, Voice, VoiceUnavailable, voiceMode } from './voice.js';
 
 export const SERVICE = { name: 'sms-agent', version: '0.1.0' };
 
@@ -224,8 +224,10 @@ export function createApp(deps: AppDeps) {
     } catch (err) {
       return failWith(res, err);
     }
-    const input = voiceMode(quota.voiceInput ?? config.voiceInput);
-    const output = voiceMode(quota.voiceOutput ?? config.voiceOutput);
+    const inChoice = quota.voiceInput ?? config.voiceInput;
+    const outChoice = quota.voiceOutput ?? config.voiceOutput;
+    const input = voiceMode(inChoice);
+    const output = voiceMode(outChoice);
     res.json({
       model: quota.model || config.model,
       conversationId: sessionOf(res).claims.agentSessionId,
@@ -233,13 +235,15 @@ export function createApp(deps: AppDeps) {
       credits: { remaining: quota.remaining, limit: quota.limit, month: quota.month },
       confirmMode: config.confirmMode,
       // input/output: what the school chose in the hub. transcribe/speak:
-      // whether server speech works right now (the app falls back to the
-      // device's own speech when it does not).
+      // whether server speech works right now — the main choice for
+      // 'server', the fallback for devices that cannot do it for 'device'.
       voice: {
         input,
         output,
-        transcribe: input === 'server' && voice.available(quota.voiceInput),
-        speak: output === 'server' && voice.available(quota.voiceOutput),
+        transcribe:
+          input !== 'off' && voice.available(serverModelFor(inChoice, quota.voiceInputModel)),
+        speak:
+          output !== 'off' && voice.available(serverModelFor(outChoice, quota.voiceOutputModel)),
       },
       limits: {
         maxMessageChars: config.maxMessageChars,
@@ -463,8 +467,8 @@ export function createApp(deps: AppDeps) {
       if (limited(res, s.owner)) return;
       const q = await withCredits(res, s);
       if (!q) return;
-      const model = q.voiceInput ?? config.voiceInput;
-      if (!voice.available(model)) return voiceOff(res);
+      const model = serverModelFor(q.voiceInput ?? config.voiceInput, q.voiceInputModel);
+      if (!model || !voice.available(model)) return voiceOff(res);
       const lang = typeof req.query.lang === 'string' && /^[a-z]{2}$/.test(req.query.lang)
         ? req.query.lang
         : undefined;
@@ -495,8 +499,8 @@ export function createApp(deps: AppDeps) {
     if (!text) return fail(res, 400, 'BAD_REQUEST', 'Nothing to say.');
     const q = await withCredits(res, s);
     if (!q) return;
-    const model = q.voiceOutput ?? config.voiceOutput;
-    if (!voice.available(model)) return voiceOff(res);
+    const model = serverModelFor(q.voiceOutput ?? config.voiceOutput, q.voiceOutputModel);
+    if (!model || !voice.available(model)) return voiceOff(res);
     try {
       const audio = await voice.speak(model, q.ttsVoice ?? config.ttsVoice, text);
       await s.backend
