@@ -1,0 +1,96 @@
+name: Deploy Agent to EC2
+
+# Only a push to development (stage) or main (production) deploys — merging a
+# PR into either is such a push. Opening or updating a PR runs nothing.
+on:
+  push:
+    branches:
+      - development
+      - main
+  workflow_dispatch:
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  APP_ENV: ${{ github.ref == 'refs/heads/development' && 'development' || 'production' }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/development' && 'development' || 'production' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test
+        run: npm test
+
+      - name: Build project
+        run: npm run build
+
+      - name: Deploy to EC2 - Prepare Environment
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            DIR_NAME="sms-agent-${{ env.APP_ENV }}"
+            mkdir -p /home/${{ secrets.EC2_USERNAME }}/$DIR_NAME
+            cd /home/${{ secrets.EC2_USERNAME }}/$DIR_NAME
+
+            # Clean up old build artifacts to prevent ghost files
+            rm -rf dist
+
+      - name: Copy files via SCP
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          source: "dist/,scripts/fetch-aws-ssm.mjs,package.json,package-lock.json,ecosystem.config.cjs"
+          target: "/home/${{ secrets.EC2_USERNAME }}/sms-agent-${{ env.APP_ENV }}"
+
+      - name: Fetch AWS SSM Params, Install Prod Dependencies and Restart PM2
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+
+            # Explicitly load Node/NVM in this non-interactive shell
+            export NVM_DIR="$HOME/.nvm"
+            if [ -s "$NVM_DIR/nvm.sh" ]; then . "$NVM_DIR/nvm.sh"; fi
+            export PATH=$PATH:/usr/local/bin
+
+            DIR_NAME="sms-agent-${{ env.APP_ENV }}"
+            cd /home/${{ secrets.EC2_USERNAME }}/$DIR_NAME
+
+            npm ci --omit=dev
+
+            # .env from /sms-agent/<env>/ in AWS SSM (the app loads it at startup)
+            SSM_ENV="${{ env.APP_ENV }}" AWS_REGION=ap-south-1 node scripts/fetch-aws-ssm.mjs
+
+            export PM2_NAME=$DIR_NAME
+            pm2 start ecosystem.config.cjs --only $DIR_NAME --update-env || pm2 restart $DIR_NAME --update-env
+            pm2 save
+
+            # Fail the deploy if the server does not come up
+            PORT=$(grep '^AGENT_PORT=' .env | cut -d= -f2 | tr -d '"')
+            for i in $(seq 1 15); do
+              curl -fsS "http://127.0.0.1:$PORT/healthz" && exit 0
+              sleep 2
+            done
+            pm2 logs $DIR_NAME --lines 40 --nostream
+            exit 1
