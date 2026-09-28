@@ -19,6 +19,12 @@ export interface Config {
   /** Sent as X-MCP-Key; must equal MCP_SHARED_SECRET in sms-mcp. */
   mcpKey: string;
   /**
+   * Sent as X-Agent-Host-Key with usage reports; must equal AGENT_HOST_KEY in
+   * sms-backend, which then refuses reports from anyone else (the assistant
+   * token also sits in the browser).
+   */
+  hostKey: string;
+  /**
    * Browser origins allowed to call this service (CORS), as one regular
    * expression. The portal is served per school on a subdomain.
    */
@@ -89,6 +95,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     smsApiUrl: trim(env.SMS_API_URL ?? 'http://localhost:4010'),
     mcpUrl: env.SMS_MCP_URL ?? 'http://127.0.0.1:4020/mcp',
     mcpKey: env.SMS_MCP_KEY ?? '',
+    hostKey: env.AGENT_HOST_KEY ?? '',
     corsOriginRegex: new RegExp(env.AGENT_CORS_ORIGIN_REGEX || DEFAULT_ORIGINS),
     openaiApiKey: env.OPENAI_API_KEY ?? '',
 

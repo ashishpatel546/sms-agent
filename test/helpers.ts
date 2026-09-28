@@ -161,6 +161,8 @@ export interface BackendState {
   sessionEnded?: boolean;
   /** The school's other hub settings, as /agent/quota reports them. */
   settings?: Record<string, unknown>;
+  /** Answer this many usage reports with 503 before accepting them. */
+  reportFailures?: number;
 }
 
 /** Routes fetch() to a fake sms-backend. */
@@ -195,7 +197,13 @@ export function fakeBackend(state: BackendState) {
     }
 
     if (url.pathname === '/agent/quota') return json(quota);
-    if (url.pathname === '/agent/usage/report') return json({ credits: 3, quota });
+    if (url.pathname === '/agent/usage/report') {
+      if (state.reportFailures) {
+        state.reportFailures--;
+        return json({ message: 'Service unavailable' }, 503);
+      }
+      return json({ credits: 3, quota });
+    }
     const m = url.pathname.match(/^\/agent\/actions\/([0-9a-f-]+)\/(confirm|cancel)$/);
     if (m) {
       if (m[2] === 'cancel') return json({ id: m[1], status: 'CANCELLED' });

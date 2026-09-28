@@ -23,6 +23,11 @@ export interface Conversation {
   pending: DraftInfo[];
   /** Set while a turn runs: one turn at a time per conversation. */
   busy: boolean;
+  /**
+   * Share of the prompt the provider last served from its cache; used to
+   * bill a cut-off round, whose own figures never arrive, at the right rate.
+   */
+  cachedShare?: number;
 }
 
 /**

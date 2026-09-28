@@ -134,9 +134,23 @@ function statusLabel(tool: ToolSpec | undefined, name: string): string {
 }
 
 /** Rough token count (≈4 characters per token) for a round that never reported usage. */
-function estimateUsage(messages: Message[], tools: ModelTool[], outputChars: number): TokenUsage {
+/**
+ * Usage for a round the provider billed but never reported (stream cut off).
+ * The prompt is split between cached and fresh input by `cachedShare`, the
+ * share the provider actually served from cache earlier in this
+ * conversation, so a cut-off reply is not billed at full rate for input the
+ * provider discounted.
+ */
+export function estimateUsage(
+  messages: Message[],
+  tools: ModelTool[],
+  outputChars: number,
+  cachedShare = 0,
+): TokenUsage {
   const promptChars = JSON.stringify(messages).length + JSON.stringify(tools).length;
-  return { input: Math.ceil(promptChars / 4), cached: 0, output: Math.ceil(outputChars / 4) };
+  const prompt = Math.ceil(promptChars / 4);
+  const cached = Math.floor(prompt * Math.min(1, Math.max(0, cachedShare)));
+  return { input: prompt - cached, cached, output: Math.ceil(outputChars / 4) };
 }
 
 /**
@@ -236,6 +250,9 @@ export class Agent {
           text += '\n\n';
           emit({ type: 'token', text: '\n\n' });
         }
+        // Stopped while tools ran: never open another model call (it would
+        // fail before being sent, and must not be billed as if it ran).
+        if (input.signal?.aborted) throw new Error('Stopped');
         let streamed = 0;
         let reply;
         try {
@@ -257,12 +274,17 @@ export class Agent {
           // A round cut off mid-stream is still billed by the provider, but
           // its usage figures never arrive: charge an estimate instead.
           if (input.signal?.aborted || streamed > 0) {
-            usage = addUsage(usage, estimateUsage(messages, modelTools, streamed));
+            usage = addUsage(
+              usage,
+              estimateUsage(messages, modelTools, streamed, conv.cachedShare ?? 0),
+            );
           }
           throw err;
         }
         usage = addUsage(usage, reply.usage);
         usedModel = reply.model ?? usedModel;
+        const prompt = reply.usage.input + reply.usage.cached;
+        if (prompt > 0) conv.cachedShare = reply.usage.cached / prompt;
 
         const assistant: Message = reply.toolCalls.length
           ? {

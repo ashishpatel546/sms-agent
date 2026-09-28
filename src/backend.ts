@@ -73,6 +73,7 @@ export class SmsBackend {
     private readonly token: string,
     private readonly slug: string,
     private readonly timeoutMs = 20_000,
+    private readonly hostKey = '',
   ) {}
 
   quota() {
@@ -84,12 +85,27 @@ export class SmsBackend {
     return this.request<{ ended: boolean }>('POST', '/agent/session/end');
   }
 
-  reportUsage(usage: HostUsage) {
-    return this.request<{ credits: number; quota: Quota }>(
-      'POST',
-      '/agent/usage/report',
-      { body: usage },
-    );
+  /**
+   * Reports model or voice usage for billing. Carries this service's host
+   * key and one report id: a failed attempt is retried (twice, on a network
+   * error or a 5xx) and sms-backend counts the id once, so a retry can never
+   * charge twice.
+   */
+  async reportUsage(usage: HostUsage) {
+    const body = { ...usage, reportId: randomUUID() };
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await this.request<{ credits: number; quota: Quota }>(
+          'POST',
+          '/agent/usage/report',
+          { body, hostKey: true },
+        );
+      } catch (err) {
+        const status = (err as { status?: number }).status ?? 0;
+        if (attempt >= 3 || (status > 0 && status < 500)) throw err;
+        await new Promise((r) => setTimeout(r, 300 * attempt));
+      }
+    }
   }
 
   /** PENDING → CONFIRMED (agent confirm mode). Returns the stored request. */
@@ -129,7 +145,7 @@ export class SmsBackend {
   async request<T>(
     method: string,
     path: string,
-    opts: { body?: unknown; tool?: string; actionId?: string } = {},
+    opts: { body?: unknown; tool?: string; actionId?: string; hostKey?: boolean } = {},
   ): Promise<T> {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.token}`,
@@ -139,6 +155,7 @@ export class SmsBackend {
     };
     if (opts.tool) headers['X-Agent-Tool'] = opts.tool;
     if (opts.actionId) headers['X-Agent-Action-Id'] = opts.actionId;
+    if (opts.hostKey && this.hostKey) headers['X-Agent-Host-Key'] = this.hostKey;
     const hasBody = opts.body !== undefined && opts.body !== null;
     if (hasBody) headers['Content-Type'] = 'application/json';
 

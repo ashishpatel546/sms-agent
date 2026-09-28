@@ -29,7 +29,7 @@ GitHub Actions `.github/workflows/deploy-ec2.yml`, same pattern as the other rep
 - Runner: `npm ci`, `npm test`, `npm run build`, then SCP `dist/`, `scripts/fetch-aws-ssm.mjs`, `package*.json`, `ecosystem.config.cjs` to `/home/deployer/sms-agent-<env>/`.
 - Server: `npm ci --omit=dev`, `node scripts/fetch-aws-ssm.mjs` writes `.env` from SSM `/sms-agent/<env>/*` (instance role `ec2-ssm-role`), PM2 start/restart as `sms-agent-<env>`, `pm2 save`, then the job fails unless `http://127.0.0.1:$AGENT_PORT/healthz` answers.
 - PM2: one fork-mode process (`ecosystem.config.cjs`, `max_memory_restart: 400M`). Logs are rotated by the server's `pm2-logrotate` module.
-- SSM `/sms-agent/development/`: `AGENT_HOST=127.0.0.1`, `AGENT_PORT=3041`, `SMS_API_URL=https://sms-dev-api.colegios.in` (the backend's public domain, as the other services use), `SMS_MCP_URL=http://127.0.0.1:3031/mcp` (sms-mcp is internal, same server), `SMS_MCP_KEY` (SecureString, equals sms-mcp's `MCP_SHARED_SECRET`), `OPENAI_API_KEY` (SecureString, the same key as `/school-ai/<env>/OPENAI_API_KEY`).
+- SSM `/sms-agent/development/`: `AGENT_HOST=127.0.0.1`, `AGENT_PORT=3041`, `SMS_API_URL=https://sms-dev-api.colegios.in` (the backend's public domain, as the other services use), `SMS_MCP_URL=http://127.0.0.1:3031/mcp` (sms-mcp is internal, same server), `SMS_MCP_KEY` (SecureString, equals sms-mcp's `MCP_SHARED_SECRET`), `AGENT_HOST_KEY` (SecureString, equals sms-backend's `AGENT_HOST_KEY`), `OPENAI_API_KEY` (SecureString, the same key as `/school-ai/<env>/OPENAI_API_KEY`).
 - The portal finds it through `AGENT_API_URL` in SSM `/sms-frontend/<env>/`.
 
 ### Domain, nginx, TLS
