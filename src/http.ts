@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
-import { Agent, toFailure, type AgentEvent, type ErrorCode } from './agent.js';
+import { Agent, creditsMessage, toFailure, type AgentEvent, type ErrorCode } from './agent.js';
 import { SmsBackend, type Quota } from './backend.js';
 import { bearer, ownerKey, requireAgentClaims, TokenError, type AgentClaims } from './claims.js';
 import type { Config } from './config.js';
@@ -232,7 +232,12 @@ export function createApp(deps: AppDeps) {
       model: quota.model || config.model,
       conversationId: sessionOf(res).claims.agentSessionId,
       idleMinutes: Math.round(config.conversationTtlMs / 60_000),
-      credits: { remaining: quota.remaining, limit: quota.limit, month: quota.month },
+      credits: {
+        remaining: quota.remaining,
+        limit: quota.limit,
+        month: quota.month,
+        limitedBy: quota.limitedBy ?? 'school',
+      },
       confirmMode: config.confirmMode,
       // input/output: what the school chose in the hub. transcribe/speak:
       // whether server speech works right now — the main choice for
@@ -432,12 +437,7 @@ export function createApp(deps: AppDeps) {
     try {
       const q = await s.backend.quota();
       if (q.remaining > 0) return q;
-      fail(
-        res,
-        402,
-        'CREDITS_EXHAUSTED',
-        `This school has used all ${q.limit} AI Assistant credits for ${q.month}. An administrator can add more.`,
-      );
+      fail(res, 402, 'CREDITS_EXHAUSTED', creditsMessage(q));
     } catch (err) {
       failWith(res, err);
     }

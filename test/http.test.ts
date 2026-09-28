@@ -138,6 +138,22 @@ describe('chat', () => {
     expect(model.requests).toHaveLength(0);
   });
 
+  it("says the person's own limit is used up when that is why", async () => {
+    state.remaining = 0;
+    state.settings = {
+      limitedBy: 'user',
+      message: 'You have used all 20 of your AI Assistant credits for 2026-09. Your school admin can raise your limit.',
+    };
+    const model = new FakeModel([{ content: 'x' }]);
+    const base = await app({ model });
+    const { events } = await chat(base, { message: 'hi' });
+    expect(events.find((e) => e.type === 'error')).toMatchObject({
+      code: 'CREDITS_EXHAUSTED',
+      message: expect.stringContaining('your AI Assistant credits'),
+    });
+    expect(model.requests).toHaveLength(0);
+  });
+
   it('keeps conversations private to their owner', async () => {
     const base = await app({ model: new FakeModel([{ content: 'Hello.' }]) });
     const first = await chat(base, { message: 'hi' });
@@ -331,7 +347,7 @@ describe('voice', () => {
     const base = await app({ model: new FakeModel([]) });
     const c = await caps(base);
     expect(c.voice).toEqual({ input: 'device', output: 'device', transcribe: false, speak: false });
-    expect(c.credits).toEqual({ remaining: 400, limit: 500, month: '2026-09' });
+    expect(c.credits).toEqual({ remaining: 400, limit: 500, month: '2026-09', limitedBy: 'school' });
     const r = await post(base, '/v1/voice/speak', { text: 'hello' });
     expect(r.status).toBe(503);
     expect(r.json.code).toBe('VOICE_UNAVAILABLE');
