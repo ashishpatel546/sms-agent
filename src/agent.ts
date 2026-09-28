@@ -1,4 +1,4 @@
-import { BackendError, type ActionRequest, type SmsBackend } from './backend.js';
+import { BackendError, type ActionRequest, type Quota, type SmsBackend } from './backend.js';
 import type { AgentClaims } from './claims.js';
 import type { Config } from './config.js';
 import {
@@ -39,6 +39,8 @@ export type AgentEvent =
       credits: number;
       remaining: number;
       limit: number;
+      /** 'user': remaining/limit are the person's own monthly limit. */
+      limitedBy: 'school' | 'user';
       /** Model tokens this turn: uncached input, cached input, output. */
       tokens: TokenUsage;
     }
@@ -198,10 +200,7 @@ export class Agent {
     try {
       const quota = await input.backend.quota();
       if (quota.remaining <= 0) {
-        throw new AgentFailure(
-          'CREDITS_EXHAUSTED',
-          `This school has used all ${quota.limit} AI Assistant credits for ${quota.month}. An administrator can add more.`,
-        );
+        throw new AgentFailure('CREDITS_EXHAUSTED', creditsMessage(quota));
       }
       // The hub's model choice, when it made one; otherwise AGENT_MODEL.
       const model: ModelChoice | undefined = quota.model
@@ -373,6 +372,7 @@ export class Agent {
         credits: r.credits,
         remaining: r.quota.remaining,
         limit: r.quota.limit,
+        limitedBy: r.quota.limitedBy ?? 'school',
         tokens: usage,
       });
     } catch (err) {
@@ -577,4 +577,12 @@ export class Agent {
       }
     }
   }
+}
+
+/** What to tell someone with no credits left: their own limit, or the school's. */
+export function creditsMessage(q: Quota): string {
+  return (
+    q.message ||
+    `This school has used all ${q.limit} AI Assistant credits for ${q.month}. An administrator can add more.`
+  );
 }

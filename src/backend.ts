@@ -16,6 +16,10 @@ export interface Quota {
   limit: number;
   used: number;
   remaining: number;
+  /** Whose credits bind: the school's, or the person's own monthly limit. */
+  limitedBy?: 'school' | 'user';
+  /** Why no credits are left, when none are (names the person's own limit). */
+  message?: string | null;
   /** sms-backend's AGENT_CONFIRM_REQUIRES_USER_TOKEN: only the app may confirm. */
   confirmRequiresUserToken?: boolean;
   /** Chat model chosen in the hub; null: use AGENT_MODEL. */
