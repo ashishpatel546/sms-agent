@@ -186,7 +186,13 @@ export function createApp(deps: AppDeps) {
       token,
       claims,
       owner: ownerKey(claims),
-      backend: new SmsBackend(config.smsApiUrl, token, claims.slug, config.requestTimeoutMs),
+      backend: new SmsBackend(
+        config.smsApiUrl,
+        token,
+        claims.slug,
+        config.requestTimeoutMs,
+        config.hostKey,
+      ),
     };
     const key = createHash('sha256').update(token).digest('hex');
     if (!isVerified(key)) {

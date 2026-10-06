@@ -98,10 +98,8 @@ export class Voice {
         prompt: PROMPT,
         ...(language ? { language } : {}),
       });
-      const usage = (res as { usage?: { type: string; seconds?: number } }).usage;
-      const seconds =
-        usage?.type === 'duration' && usage.seconds ? usage.seconds : clientSeconds;
-      return { text: res.text.trim(), seconds: Math.max(1, Math.round(seconds)) };
+      const usage = (res as { usage?: ProviderSttUsage }).usage;
+      return { text: res.text.trim(), seconds: billedSeconds(usage, clientSeconds) };
     } catch (err) {
       throw this.failure(err, 'stt', model);
     }
@@ -146,4 +144,37 @@ export class Voice {
       kind === 'stt' ? "Couldn't make out the audio. Try again." : "Couldn't play the reply aloud.",
     );
   }
+}
+
+/** Usage as the transcription API reports it: by duration, or by tokens. */
+export interface ProviderSttUsage {
+  type: string;
+  seconds?: number;
+  input_tokens?: number;
+  input_token_details?: { audio_tokens?: number };
+}
+
+/**
+ * Audio tokens per second of speech, set high on purpose: it turns the
+ * provider's audio token count into a floor on the clip's length that never
+ * exceeds the real length (OpenAI prices its transcribe models at about
+ * 1,000 audio tokens a minute).
+ */
+export const AUDIO_TOKENS_PER_SECOND = 1000 / 60;
+
+/**
+ * Seconds to bill for a transcribed clip. The provider's own duration when
+ * it gives one; otherwise the length the app declared, but never less than
+ * what the provider's audio tokens show was sent, so an app cannot declare
+ * a long recording as a short one. Rounded to a tenth of a second.
+ */
+export function billedSeconds(usage: ProviderSttUsage | undefined, clientSeconds: number): number {
+  let seconds = clientSeconds;
+  if (usage?.type === 'duration' && usage.seconds) {
+    seconds = usage.seconds;
+  } else if (usage?.type === 'tokens') {
+    const audio = usage.input_token_details?.audio_tokens ?? usage.input_tokens ?? 0;
+    seconds = Math.max(clientSeconds, audio / AUDIO_TOKENS_PER_SECOND);
+  }
+  return Math.max(0.1, Math.round(seconds * 10) / 10);
 }

@@ -121,6 +121,7 @@ describe('chat', () => {
       inputTokens: 2400,
       cachedInputTokens: 6000,
       outputTokens: 300,
+      reportId: expect.stringMatching(/^[0-9a-f-]{36}$/),
     });
     // The tool result went back to the model, and confirm_action was never offered.
     const second = model.requests[1]!;
