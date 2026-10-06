@@ -36,6 +36,7 @@ export type AgentEvent =
   | { type: 'action'; ok: boolean; text: string; actionIds: string[]; outcome: ActionOutcome }
   | {
       type: 'usage';
+      /** Everything this turn cost: model, tools and confirmed changes. */
       credits: number;
       remaining: number;
       limit: number;
@@ -205,15 +206,25 @@ export class Agent {
     const { conv, message, emit } = input;
     conv.transcript.push({ role: 'user', text: message, at: new Date().toISOString() });
 
-    if (await this.answerPendingDraft(input)) return;
+    if (await this.answerPendingDraft(input)) {
+      // A typed yes may have run a change, which sms-backend charged.
+      await this.emitCredits(input, null);
+      return;
+    }
 
-    let usage = emptyUsage();
+    // Model usage is reported after every round, so the tool calls of the
+    // next round are checked against credits that already include it.
+    const meter: TurnMeter = { unreported: emptyUsage(), tokens: emptyUsage(), credits: 0, toolsRan: false };
     let usedModel = this.model.name;
     let historyTurns = this.config.historyMaxTurns;
     const entry: TranscriptEntry = { role: 'assistant', text: '', at: '' };
     try {
       const quota = await input.backend.quota();
-      if (quota.remaining <= 0) {
+      meter.start = quota;
+      meter.last = quota;
+      // Enough for the most expensive tool, so a question is not refused
+      // halfway through its answer.
+      if (quota.remaining < Math.max(1, quota.minTurnCredits ?? 1)) {
         throw new AgentFailure('CREDITS_EXHAUSTED', creditsMessage(quota));
       }
       // The hub's model choice, when it made one; otherwise AGENT_MODEL.
@@ -253,6 +264,11 @@ export class Agent {
         // Stopped while tools ran: never open another model call (it would
         // fail before being sent, and must not be billed as if it ran).
         if (input.signal?.aborted) throw new Error('Stopped');
+        // Out of credits after the last round: stop rather than run past
+        // the limit.
+        if (round > 0 && meter.last && meter.last.remaining <= 0) {
+          throw new AgentFailure('CREDITS_EXHAUSTED', creditsMessage(meter.last));
+        }
         let streamed = 0;
         let reply;
         try {
@@ -274,15 +290,16 @@ export class Agent {
           // A round cut off mid-stream is still billed by the provider, but
           // its usage figures never arrive: charge an estimate instead.
           if (input.signal?.aborted || streamed > 0) {
-            usage = addUsage(
-              usage,
+            meter.unreported = addUsage(
+              meter.unreported,
               estimateUsage(messages, modelTools, streamed, conv.cachedShare ?? 0),
             );
           }
           throw err;
         }
-        usage = addUsage(usage, reply.usage);
         usedModel = reply.model ?? usedModel;
+        meter.unreported = addUsage(meter.unreported, reply.usage);
+        await this.reportUsage(input, meter, usedModel);
         const prompt = reply.usage.input + reply.usage.cached;
         if (prompt > 0) conv.cachedShare = reply.usage.cached / prompt;
 
@@ -307,6 +324,7 @@ export class Agent {
         for (const call of reply.toolCalls) {
           emit({ type: 'status', tool: call.name, label: statusLabel(byName.get(call.name), call.name) });
         }
+        meter.toolsRan = true;
         let fatal: unknown = null;
         const results = await Promise.all(
           reply.toolCalls.map(async (call): Promise<ToolOutcome> => {
@@ -374,13 +392,17 @@ export class Agent {
       if (conv.transcript.length > MAX_TRANSCRIPT) {
         conv.transcript.splice(0, conv.transcript.length - MAX_TRANSCRIPT);
       }
-      await this.reportUsage(input, usage, usedModel);
+      await this.reportUsage(input, meter, usedModel);
+      if (meter.start) await this.emitCredits(input, meter);
     }
   }
 
-  /** Charges the school for the model tokens this turn used. */
-  private async reportUsage(input: TurnInput, usage: TokenUsage, model: string) {
+  /** Charges the person and the school for model tokens not yet reported. */
+  private async reportUsage(input: TurnInput, meter: TurnMeter, model: string) {
+    const usage = meter.unreported;
     if (!usage.input && !usage.cached && !usage.output) return;
+    meter.unreported = emptyUsage();
+    meter.tokens = addUsage(meter.tokens, usage);
     try {
       const r = await input.backend.reportUsage({
         kind: 'LLM',
@@ -389,17 +411,38 @@ export class Agent {
         cachedInputTokens: usage.cached,
         outputTokens: usage.output,
       });
-      input.emit({
-        type: 'usage',
-        credits: r.credits,
-        remaining: r.quota.remaining,
-        limit: r.quota.limit,
-        limitedBy: r.quota.limitedBy ?? 'school',
-        tokens: usage,
-      });
+      meter.credits += r.credits;
+      meter.last = r.quota;
+      meter.toolsRan = false;
     } catch (err) {
       console.error('[sms-agent] usage report failed', (err as Error).message);
     }
+  }
+
+  /**
+   * Tells the app the credits left after a turn and what the turn cost in
+   * all (model, tools and any change confirmed). Tools are charged by
+   * sms-backend, so the figures come from it: the last usage report, or a
+   * fresh look when tools ran after it.
+   */
+  private async emitCredits(input: TurnInput, meter: TurnMeter | null) {
+    let q = meter?.last;
+    if (!q || !meter || meter.toolsRan || q === meter.start) {
+      q = await input.backend.quota().catch(() => undefined);
+    }
+    if (!q) return;
+    const startUsed = meter?.start?.userUsed;
+    input.emit({
+      type: 'usage',
+      credits:
+        startUsed !== undefined && q.userUsed !== undefined
+          ? Math.max(0, q.userUsed - startUsed)
+          : (meter?.credits ?? 0),
+      remaining: q.remaining,
+      limit: q.limit,
+      limitedBy: q.limitedBy ?? 'school',
+      tokens: meter?.tokens ?? emptyUsage(),
+    });
   }
 
   /** New drafts replace the previous reply's: the user can't confirm stale ones. */
@@ -601,10 +644,27 @@ export class Agent {
   }
 }
 
-/** What to tell someone with no credits left: their own limit, or the school's. */
+/** What to tell someone without enough credits: their own limit, or the school's. */
 export function creditsMessage(q: Quota): string {
+  if (q.remaining > 0) {
+    const whose = q.limitedBy === 'user' ? 'of your' : "of this school's";
+    return `Only ${q.remaining} ${whose} AI Assistant credits ${q.remaining === 1 ? 'is' : 'are'} left for ${q.month}, which is not enough for an answer.${q.limitedBy === 'user' ? ' Your school admin can raise your limit.' : ' An administrator can add more.'}`;
+  }
   return (
     q.message ||
     `This school has used all ${q.limit} AI Assistant credits for ${q.month}. An administrator can add more.`
   );
+}
+
+/** One turn's credits: what is still to report, and what it has cost. */
+interface TurnMeter {
+  unreported: TokenUsage;
+  /** Model tokens reported this turn. */
+  tokens: TokenUsage;
+  /** Model credits charged this turn. */
+  credits: number;
+  /** Tools ran since the last report, so `last` misses their charges. */
+  toolsRan: boolean;
+  start?: Quota;
+  last?: Quota;
 }
