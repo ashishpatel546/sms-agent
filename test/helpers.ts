@@ -163,6 +163,10 @@ export interface BackendState {
   settings?: Record<string, unknown>;
   /** Answer this many usage reports with 503 before accepting them. */
   reportFailures?: number;
+  /** The person's own credits used this month; each usage report adds 3. */
+  userUsed?: number;
+  /** true: each usage report also takes its 3 credits off `remaining`. */
+  chargeReports?: boolean;
 }
 
 /** Routes fetch() to a fake sms-backend. */
@@ -185,6 +189,7 @@ export function fakeBackend(state: BackendState) {
       model: state.model ?? null,
       reasoningEffort: null,
       sessionIdleMinutes: 30,
+      ...(state.userUsed !== undefined && { userUsed: state.userUsed }),
       ...state.settings,
     };
     if (state.tokenValid === false) return json({ message: 'Unauthorized' }, 401);
@@ -202,7 +207,17 @@ export function fakeBackend(state: BackendState) {
         state.reportFailures--;
         return json({ message: 'Service unavailable' }, 503);
       }
-      return json({ credits: 3, quota });
+      if (state.userUsed !== undefined) state.userUsed += 3;
+      if (state.chargeReports) state.remaining = Math.max(0, state.remaining - 3);
+      return json({
+        credits: 3,
+        quota: {
+          ...quota,
+          remaining: state.remaining,
+          used: 500 - state.remaining,
+          ...(state.userUsed !== undefined && { userUsed: state.userUsed }),
+        },
+      });
     }
     const m = url.pathname.match(/^\/agent\/actions\/([0-9a-f-]+)\/(confirm|cancel)$/);
     if (m) {

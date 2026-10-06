@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { Agent, estimateUsage } from '../src/agent.js';
+import { Agent, estimateUsage, type AgentEvent } from '../src/agent.js';
 import { SmsBackend } from '../src/backend.js';
 import type { Conversation } from '../src/conversations.js';
 import type { ToolOutcome, ToolSource } from '../src/mcp.js';
@@ -130,5 +130,79 @@ describe('voice input length', () => {
 
   it('does not round a short clip up to a whole second', () => {
     expect(billedSeconds(undefined, 0.42)).toBe(0.4);
+  });
+});
+
+describe('limits during a reply', () => {
+  const tools = (): ToolSource => ({
+    catalog: async () => ({ tools: TOOL_SPECS, instructions: '' }),
+    call: async (): Promise<ToolOutcome> => ({ text: 'ok', isError: false }),
+    close: async () => undefined,
+  });
+  async function turn(model: FakeModel, message = 'briefing') {
+    const events: AgentEvent[] = [];
+    await new Agent(testConfig(), model).runTurn({
+      conv: conversation(),
+      claims: claims(),
+      message,
+      mode: 'text',
+      tools: tools(),
+      backend: new SmsBackend(BACKEND, 'tok', 'edusphere'),
+      emit: (e) => events.push(e),
+    });
+    return events;
+  }
+
+  it('does not start a reply that could not afford its costliest tool', async () => {
+    state.remaining = 2;
+    state.settings = { minTurnCredits: 3, limitedBy: 'user' };
+    const model = new FakeModel([{ content: 'x' }]);
+    const events = await turn(model);
+    expect(model.requests).toHaveLength(0);
+    expect(events.find((e) => e.type === 'error')).toMatchObject({
+      code: 'CREDITS_EXHAUSTED',
+      message: expect.stringContaining('Only 2 of your AI Assistant credits are left'),
+    });
+  });
+
+  it('stops before another model round once the credits are gone', async () => {
+    // The first round's report uses the last 3 credits.
+    state.remaining = 3;
+    state.chargeReports = true;
+    const model = new FakeModel([
+      { toolCalls: [{ name: 'daily_briefing', args: {} }] },
+      { content: 'never asked' },
+    ]);
+    const events = await turn(model);
+    expect(model.requests).toHaveLength(1);
+    expect(events.find((e) => e.type === 'error')).toMatchObject({ code: 'CREDITS_EXHAUSTED' });
+  });
+
+  it("reports everything the turn cost, not only the model's share", async () => {
+    // Two model rounds (3 each) plus the tool, which sms-backend charged.
+    state.userUsed = 10;
+    const model = new FakeModel([
+      { toolCalls: [{ name: 'daily_briefing', args: {} }] },
+      { content: 'done' },
+    ]);
+    const events = await turn(model);
+    // The fake charges reports only; the end figure comes from the last one.
+    expect(events.at(-1)).toMatchObject({ type: 'usage', credits: 6 });
+  });
+
+  it('refreshes the credits after a typed yes or no', async () => {
+    const conv = conversation();
+    conv.pending = [{ action_ids: ['a1'], summary: 'Mark leave', expires_at: null } as never];
+    const events: AgentEvent[] = [];
+    await new Agent(testConfig(), new FakeModel([])).runTurn({
+      conv,
+      claims: claims(),
+      message: 'no',
+      mode: 'text',
+      tools: tools(),
+      backend: new SmsBackend(BACKEND, 'tok', 'edusphere'),
+      emit: (e) => events.push(e),
+    });
+    expect(events.at(-1)).toMatchObject({ type: 'usage', remaining: 400 });
   });
 });

@@ -385,7 +385,19 @@ export function createApp(deps: AppDeps) {
       const quota = await sessionOf(res)
         .backend.quota()
         .catch(() => null);
-      res.json(quota ? { ...result, credits: { remaining: quota.remaining, limit: quota.limit } } : result);
+      res.json(
+        quota
+          ? {
+              ...result,
+              credits: {
+                remaining: quota.remaining,
+                limit: quota.limit,
+                month: quota.month,
+                limitedBy: quota.limitedBy ?? 'school',
+              },
+            }
+          : result,
+      );
     } catch (err) {
       failWith(res, err);
     } finally {

@@ -26,7 +26,7 @@ The service keeps no secrets except the model provider key, and has no database.
 
    It calls tools, possibly several in parallel, for up to `AGENT_MAX_TOOL_ROUNDS` rounds. Text streams to the app as it is written.
 4. **Drafts.** A `draft_*` result carries `structuredContent.draft`. The app shows it as a card with **Confirm and save** and **Cancel**. A new draft replaces the previous one, which is cancelled in sms-backend.
-5. **Metering.** The turn's tokens are reported to `POST /agent/usage/report`, with prompt-cache hits counted separately. The school's balance comes back to the app.
+5. **Metering.** A reply starts only when the person has at least `minTurnCredits` left (the costliest tool's price, from `GET /agent/quota`). Each model round's tokens are reported to `POST /agent/usage/report` as soon as the round ends, with prompt-cache hits counted separately, so the next round's tool calls are checked against credits that include it; no further round starts once the credits are gone. The final `usage` event carries the whole turn's cost (model, tools and any confirmed change) and the balance; a typed yes/no also ends with one.
 
 **Why the model can't confirm.** Approval is always the person's own act: pressing a button, or saying a plain yes. That text never passes through the model. So wording hidden in the data (a student name, a leave reason) cannot talk the model into approving something. sms-backend then runs only the exact request that was confirmed, and only once.
 

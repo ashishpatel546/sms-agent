@@ -112,16 +112,23 @@ describe('chat', () => {
     expect(events.at(-1)).toMatchObject({ type: 'usage', remaining: 400 });
     expect(events.at(-2)).toMatchObject({ type: 'done' });
 
-    // Quota is checked before the model is used; usage is reported after.
+    // Quota is checked before the model is used; each model round is
+    // reported as soon as it ends, so the next round's tools see it.
     expect(paths()[0]).toBe('GET /agent/quota');
-    const report = state.calls.find((c) => c.path === '/agent/usage/report')!;
-    expect(report.body).toEqual({
-      kind: 'LLM',
-      model: 'fake-model',
-      inputTokens: 2400,
-      cachedInputTokens: 6000,
-      outputTokens: 300,
-      reportId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+    const reports = state.calls.filter((c) => c.path === '/agent/usage/report');
+    expect(reports).toHaveLength(2);
+    for (const report of reports) {
+      expect(report.body).toEqual({
+        kind: 'LLM',
+        model: 'fake-model',
+        inputTokens: 1200,
+        cachedInputTokens: 3000,
+        outputTokens: 150,
+        reportId: expect.stringMatching(/^[0-9a-f-]{36}$/),
+      });
+    }
+    expect(events.at(-1)).toMatchObject({
+      tokens: { input: 2400, cached: 6000, output: 300 },
     });
     // The tool result went back to the model, and confirm_action was never offered.
     const second = model.requests[1]!;
